@@ -1,0 +1,14 @@
+# Example Outfitters
+
+> Outdoor gear, repairs and rentals in Royal Oak.
+
+Hand-written notes: we open at 9.
+
+## Key pages
+
+- [Shop](https://example.com/shop): everything we sell
+- [Repairs](https://example.com/repairs): bring it in
+
+## Agent access
+
+- [Our own API docs](https://example.com/api): for partners

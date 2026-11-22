@@ -1,0 +1,133 @@
+########################################################################
+# Type check, test and build on merges to develop and main, and on
+# release tags. Run a branch by hand from the Actions tab.
+#
+# This needs no secrets. The Auth0 client id is a build-time input, and a
+# build without it still succeeds — it only produces a package that cannot
+# sign in, which is fine for checking that the code compiles and the tests
+# pass. Keeping it secret-free is what would make it safe to run on pull
+# requests from forks, should that trigger come back.
+########################################################################
+
+name: CI
+
+on:
+  # CI runs only on merges to develop and main (and release tags), to save Actions minutes.
+  # Feature and fix branches get no automatic run; start one by hand from the Actions tab
+  # (workflow_dispatch) when a branch needs it.
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor the package declares, and current LTS.
+        node: ['20', '22']
+    name: node ${{ matrix.node }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Check the package contents
+        # Catches a file that should not ship — or a missing one — before a
+        # publish does. `files` in package.json is the allowlist.
+        run: npm pack --dry-run
+
+      - name: Nothing internal in the npm package
+        run: node release/check-public.mjs dist README.md CHANGELOG.md LICENSE NOTICE TRADEMARK.md THIRD_PARTY_NOTICES.md docs
+
+      - name: Nothing internal in the public tree
+        # What the mirror receives: the tree as `git archive` gives it, without export-ignore files.
+        run: |
+          tree="$RUNNER_TEMP/public-tree"
+          mkdir -p "$tree"
+          git archive --format=tar HEAD | tar -x -C "$tree"
+          node release/check-public.mjs "$tree"
+
+  # The standalone build (release/build.mjs) on each platform it targets, run where it will run:
+  # the tarball for this runner is built with the pinned Node.js, unpacked, and started with no
+  # node on PATH; then signed with a throwaway key made for this run, and installed by install.sh
+  # into a temporary HOME, which checks the signature with the tarball's own Node.
+  standalone:
+    name: standalone ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, platform: darwin-arm64 }
+          - { os: macos-15-intel, platform: darwin-x64 }
+          - { os: ubuntu-latest, platform: linux-x64 }
+          - { os: ubuntu-24.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      # Made here, used for this run only, and never stored: the release can't be published.
+      - name: A throwaway signing key
+        run: |
+          node release/keygen.mjs "$RUNNER_TEMP/keys/test.pem" | tee "$RUNNER_TEMP/keygen.txt"
+          echo "TEST_KEY=$(sed -n 's/^  \(MCow[^ ]*\)$/\1/p' "$RUNNER_TEMP/keygen.txt")" >> "$GITHUB_ENV"
+
+      - name: Build the tarball
+        run: npm run release:build -- --platforms ${{ matrix.platform }} --trust-key "$TEST_KEY"
+
+      - name: Run it
+        run: sh release/smoke-tarball.sh dist/release/download/v*/nxis-*-${{ matrix.platform }}.tar.gz
+
+      - name: Sign it with the throwaway key
+        run: node release/sign.mjs --key "$RUNNER_TEMP/keys/test.pem" --trust-key "$TEST_KEY"
+
+      - name: Install it with install.sh
+        run: |
+          set -eu
+          home="$RUNNER_TEMP/home"; mkdir -p "$home"
+          # No node on PATH: the tarball's own Node, once it matches its pinned hash, checks the
+          # signature.
+          env -i HOME="$home" PATH=/usr/bin:/bin SHELL=/bin/sh sh dist/release/download/v*/install.sh --from dist/release/download/v*
+          env -i HOME="$home" PATH=/usr/bin:/bin "$home/.local/bin/nxis" --version
+          readlink "$home/.nxis/current"
+
+      - name: install.sh passes shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck release/install.sh release/smoke-tarball.sh
+
+      - name: Nothing internal in it
+        run: node release/check-public.mjs dist/release

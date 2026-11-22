@@ -1,0 +1,531 @@
+{
+  "about": "The tools/list results the tool definitions in src/tools/ are checked against. Re-record with `node scripts/record-tools.mjs` after `npm run build`.",
+  "source": "recorded",
+  "recorded_at": "2026-11-04",
+  "provisioning": {
+    "tools": [
+      {
+        "name": "nxis_aio_files",
+        "description": "The AI discovery documents for this site — llms.txt, agents.md, ai-catalog.json and mcp/catalog.json — with the path each belongs at. Write them into the site's public root and deploy. Merge rather than overwrite if any already exist.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            }
+          }
+        }
+      },
+      {
+        "name": "nxis_bind_mcp_action",
+        "description": "Expose the site's actions — booking, quote requests, sign-ups — as MCP write tools, and choose where their submissions go. Defaults to the page that hosts the action, which needs no configuration. Route elsewhere only when the user has told you where: never invent a destination. Call nxis_mcp_settings first to see the current routing. To pause actions or turn them back on, send only enabled, with no route: the routes are kept as they are.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "Defaults to true. False stops generating action tools. Sent without route, it only turns actions off or on and keeps every route, override and webhook secret as it is; turning on that way needs a route bound already."
+            },
+            "route": {
+              "type": "string",
+              "enum": [
+                "browser",
+                "webhook",
+                "gateway"
+              ],
+              "description": "Where submissions go. 'browser' runs the action on the page that declares it and needs nothing else. 'webhook' posts to a URL the user gives you. 'gateway' is configured in the dashboard. Defaults to 'browser' when enabled is not sent; with enabled alone, the routes are left as they are."
+            },
+            "webhook_url": {
+              "type": "string",
+              "description": "Required when route is 'webhook'. Must be a URL the user named — ask for it rather than guessing. It does not have to be on the site's own domain."
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "apply",
+                "ask",
+                "buy",
+                "donate",
+                "order",
+                "pay",
+                "quote",
+                "reserve",
+                "schedule"
+              ],
+              "description": "Route only this kind of action, leaving the rest on the default. Omit to set the default."
+            }
+          }
+        }
+      },
+      {
+        "name": "nxis_bulk_autofill",
+        "description": "Bulk-generate structured data across many resources. `plan` reports how many resources match and the organization's remaining credit balance, and writes nothing — use it to get consent before spending. `submit` starts the batch. `status` reports progress for a batch_id; with no batch_id it lists the site's latest batches, newest first, so if a `submit` response was lost call `status` with no batch_id to find the batch rather than submitting again. Set `existing` to `import` when the site already publishes JSON-LD (WordPress with Yoast or Rank Math, Shopify, most headless builds): its own structured data is brought in with no AI, at a flat rate per page, instead of being generated.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "plan",
+                "submit",
+                "status"
+              ],
+              "description": "plan = count and price it, changing nothing. submit = start the batch. status = check a batch, or list the latest batches when batch_id is omitted."
+            },
+            "media_type": {
+              "type": "string",
+              "enum": [
+                "HTML",
+                "IMAGE",
+                "VIDEO",
+                "AUDIO"
+              ],
+              "description": "Restrict to one media type. Must be the exact upper-case name."
+            },
+            "pattern": {
+              "type": "string",
+              "description": "Restrict to a URL path cluster, e.g. /products/*"
+            },
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint, rejected elsewhere."
+            },
+            "batch_id": {
+              "type": "string",
+              "description": "The batch to check with status. Omit it to list the site's latest batches, e.g. after a lost submit response."
+            },
+            "autofill_mode": {
+              "type": "string",
+              "description": "What to generate, e.g. IMAGE_METADATA for deterministic ImageObject records."
+            },
+            "partial_ok": {
+              "type": "boolean",
+              "description": "Allow the batch to proceed when some selections cannot be expanded."
+            },
+            "only_without_entities": {
+              "type": "boolean",
+              "description": "Skip resources that already have structured data."
+            },
+            "existing": {
+              "type": "string",
+              "enum": [
+                "generate",
+                "import",
+                "import_and_complete"
+              ],
+              "description": "generate (default): AI writes the structured data. import: bring in the JSON-LD each page already publishes, with no AI, at a flat rate per page; pages that publish none finish with nothing to import. import_and_complete: import, then let AI generate only what each page lacks; a page with none is generated in full. Imported data is available to agents and not added to the page again."
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      },
+      {
+        "name": "nxis_crawl_sitemap",
+        "description": "Crawl a sitemap into this site's resources. `submit` queues it and returns immediately; `status` reports the crawl's state for the same URL. Crawling runs in the background, so poll `status` until it reaches COMPLETE before doing anything that counts resources.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "Sitemap URL. The site's own, or a generated one."
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "submit",
+                "status"
+              ],
+              "description": "submit queues the crawl, status reports it. Defaults to submit."
+            },
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      },
+      {
+        "name": "nxis_create_site",
+        "description": "Create a site in this organization. Give the site's root URL. The host is fixed at creation — a site created against the wrong domain has to be deleted rather than edited, so confirm the URL with the user rather than inferring it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "Root URL, e.g. https://example.com"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      },
+      {
+        "name": "nxis_enable_public_mcp",
+        "description": "Turn the site's MCP server on so agents can query its structured data without a key. This is what makes everything else in setup useful. Pass enabled false to turn it off again.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "Defaults to true."
+            }
+          }
+        }
+      },
+      {
+        "name": "nxis_list_in_app",
+        "description": "List the site in the NxisAI app for Claude and ChatGPT, where people can find it, browse its records and act on it. Off until the site owner turns it on. Listing it publishes the site's WebSite, the name and description its home page gives, which the app shows on its card. Pass listed false to remove it, or preview true to see how the app would list it (title, description, places, verticals, capabilities) without changing anything.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            },
+            "listed": {
+              "type": "boolean",
+              "description": "Defaults to true."
+            },
+            "preview": {
+              "type": "boolean",
+              "description": "Report how the app would list the site, and change nothing."
+            }
+          }
+        }
+      },
+      {
+        "name": "nxis_list_sites",
+        "description": "List the sites in this organization: each site's id (what other tools take as `site`), domain, display name, whether it is verified, and its MCP server's state — enabled, public, listed in the NxisAI app. `mcp` is absent for a site whose MCP server has never been set up. Read-only.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "description": "Most sites to return. Default 100."
+            }
+          }
+        }
+      },
+      {
+        "name": "nxis_mcp_settings",
+        "description": "Read this site's MCP configuration: whether the server is enabled and public, whether action tools are generated, and where each action's submissions are routed. Read-only — use it before changing anything, and to confirm a change afterwards. It creates nothing: on a site that has never been set up it reports the defaults with configured false.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            }
+          }
+        }
+      },
+      {
+        "name": "nxis_on_page_agent",
+        "description": "Say that the site's pages run the NxisAI agent (@nxisai/agent-harness), so links to a page with a form open the agent on that form. Turn it on only once the agent loads on the site's production pages. Pass enabled false to turn it off.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "Defaults to true."
+            }
+          }
+        }
+      },
+      {
+        "name": "nxis_publish_entities",
+        "description": "Publish this site's draft structured data so it is served. Scope with `schema_type` (e.g. ImageObject) or omit it to publish every type. Set dry_run to count what would publish without changing anything. Generated data starts in a disabled state, so this is what makes it live.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "schema_type": {
+              "type": "string",
+              "description": "schema.org type to publish, e.g. ImageObject or Product. Omit to publish every type."
+            },
+            "dry_run": {
+              "type": "boolean",
+              "description": "Count what would publish and write nothing."
+            },
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            }
+          }
+        }
+      },
+      {
+        "name": "nxis_set_site_name",
+        "description": "Set the site's display name: the title its MCP server card shows, and the name it is listed under in the NxisAI app for Claude and ChatGPT. Use the business's or site's own name, as people would search for it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            },
+            "display_name": {
+              "type": "string",
+              "description": "1 to 80 characters."
+            }
+          },
+          "required": [
+            "display_name"
+          ]
+        }
+      },
+      {
+        "name": "nxis_site_tag",
+        "description": "Issue or read the NxisAI site tag token for a VERIFIED site. `status` returns the current token and its decoded claims. `issue` signs one for the given hosts with WebMCP mode `browser` unless told otherwise; the site's own host is always included. Scheme and port are ignored — `localhost` covers every local port. Re-issuing does not break the live tag: the previous token stays valid until it expires.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "status",
+                "issue"
+              ],
+              "description": "status = read the current token. issue = sign one."
+            },
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            },
+            "domains": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "issue only. Hosts or URLs the tag may run on, e.g. [\"example.com\", \"localhost\"]. The site's own host is always added."
+            },
+            "webmcp_mode": {
+              "type": "string",
+              "enum": [
+                "browser",
+                "ssr",
+                "none"
+              ],
+              "description": "issue only. Defaults to browser."
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      },
+      {
+        "name": "nxis_verify_site",
+        "description": "Prove ownership of a site. `token` returns a META tag to add to the site's HTML head — it must then be deployed to the live site. `check` looks for it. A failed check almost always means the deploy has not landed yet rather than that anything is wrong.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "token",
+                "check"
+              ],
+              "description": "token = get the tag. check = verify it is live."
+            },
+            "site": {
+              "type": "string",
+              "description": "Site id. Required on the provisioning endpoint."
+            },
+            "url": {
+              "type": "string",
+              "description": "Site URL. Defaults to the site's own domain."
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      }
+    ]
+  },
+  "site": {
+    "tools": [
+      {
+        "name": "nxis_action",
+        "description": "Executes a server-side action (e.g. a quote, reservation, or registration) discovered via nxis_get. Pass the action's @id and the argument values for its declared inputs. Requires authentication. For BOOKING actions whose target carries nxis:supportsCheck, mode \"check\" runs an availability dry-run ({available, alternatives?}) without committing.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "The action's JSON-LD @id, as returned by nxis_get"
+            },
+            "arguments": {
+              "type": "object",
+              "description": "Field values keyed by the action's input valueName(s)"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "check",
+                "review",
+                "commit"
+              ],
+              "description": "Top-level parameter (a sibling of arguments, NOT inside it). check = availability dry-run (BOOKING; requires nxis:supportsCheck on the action's target), review = validate and list exactly what a commit would send, and where, without sending anything, commit = execute the action (default)"
+            }
+          },
+          "required": [
+            "id"
+          ]
+        }
+      },
+      {
+        "name": "nxis_get",
+        "description": "Fetches a single entity by its JSON-LD @id. Returns the full structured record. Use this after nxis_query to retrieve complete details for a specific entity.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "The JSON-LD @id of the entity to retrieve (e.g. 'https://royaloak.example.com/hatzel-and-sons-plumbing')"
+            }
+          },
+          "required": [
+            "id"
+          ]
+        }
+      },
+      {
+        "name": "nxis_list_types",
+        "description": "Lists all schema.org types present in this site's corpus, with counts and hierarchy info. Use this to discover what types of entities are available before querying.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "description": "Maximum types to return, ordered by count descending (default 200). The response carries `total` for the full corpus count and `truncated: true` when capped."
+            },
+            "include_ancestors": {
+              "type": "boolean",
+              "description": "Include each type's schema.org ancestor chain (default false — ancestors dominate the payload; request them only when hierarchy matters)."
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "nxis_query",
+        "description": "Queries typed records in the site corpus by schema.org type, with optional semantic text search, field filters, sorting, and pagination. Entities repeated across pages of the site — footer and sidebar content, for example — are returned once and annotated with nxis:pageCount, so a page of results can be shorter than `limit` without the corpus being exhausted. Results come back, and are shown, in the order returned: when the person asks for the best, top-rated, cheapest or newest, sort in the query (filter.sort_option, e.g. aggregateRating.ratingValue DESCENDING) instead of ranking the results yourself. Use nxis_list_types first to discover available types.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "Optional natural-language query for semantic search"
+            },
+            "limit": {
+              "type": "integer",
+              "default": 10,
+              "description": "Max results to return (1-100)"
+            },
+            "page_token": {
+              "type": "string",
+              "description": "Pagination token from a previous response"
+            },
+            "filter": {
+              "type": "object",
+              "description": "Type and field filter configuration",
+              "properties": {
+                "schema_type": {
+                  "type": "string",
+                  "description": "Schema.org type to filter by (e.g. 'Plumber', 'LocalBusiness', 'Product'). Parent types match subtypes unless exact_type_match is true."
+                },
+                "exact_type_match": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "If true, match only the exact type; do not expand to subtypes"
+                },
+                "field_filters": {
+                  "type": "array",
+                  "description": "Structured field filters on the JSON-LD data",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "description": "Dot-path into JSON-LD data (e.g. 'areaServed.postalCode', 'aggregateRating.ratingValue')"
+                      },
+                      "operator": {
+                        "type": "string",
+                        "enum": [
+                          "EQUALS",
+                          "NOT_EQUALS",
+                          "GREATER_THAN",
+                          "GREATER_THAN_OR_EQUAL",
+                          "LESS_THAN",
+                          "LESS_THAN_OR_EQUAL",
+                          "CONTAINS",
+                          "IN",
+                          "EXISTS"
+                        ]
+                      },
+                      "value": {
+                        "description": "Value to compare against (not needed for EXISTS)"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "operator"
+                    ]
+                  }
+                },
+                "sort_option": {
+                  "type": "object",
+                  "properties": {
+                    "property": {
+                      "type": "string",
+                      "description": "Field path to sort by, e.g. aggregateRating.ratingValue or offers.price"
+                    },
+                    "order": {
+                      "type": "string",
+                      "enum": [
+                        "ASCENDING",
+                        "DESCENDING"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "property",
+                    "order"
+                  ]
+                }
+              },
+              "required": [
+                "schema_type"
+              ]
+            }
+          },
+          "required": [
+            "filter"
+          ]
+        }
+      }
+    ]
+  }
+}

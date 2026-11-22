@@ -1,0 +1,66 @@
+{
+  "name": "@nxisai/cli",
+  "version": "0.2.0-beta.0",
+  "description": "Sign in to NxisAI from the terminal, pick a plan, and hand your coding agent a working MCP connection.",
+  "type": "module",
+  "bin": {
+    "nxis": "dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "TRADEMARK.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build:config": "node scripts/build-config.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && npm run build:config && tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "typecheck": "npm run build:config && tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run build:config",
+    "test": "vitest run",
+    "test:watch": "npm run build:config && vitest",
+    "prepublishOnly": "node scripts/build-config.mjs --require && npm run build",
+    "release:build": "npm run build:config && node release/build.mjs",
+    "check:public": "node release/check-public.mjs"
+  },
+  "keywords": [
+    "nxis",
+    "mcp",
+    "cli",
+    "agent",
+    "onboarding",
+    "schema.org"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nxisai/cli.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "0.28.2",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.12"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  }
+}

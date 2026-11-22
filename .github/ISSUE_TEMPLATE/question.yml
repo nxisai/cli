@@ -1,0 +1,38 @@
+name: Question or unclear behaviour
+description: Something is confusing, undocumented, or does not work the way you expected.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions are welcome here. If a message or a document left you guessing, that is worth
+        reporting even if nothing is technically broken — unclear errors are bugs in our writing.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do
+      description: What you were attempting, and where it stopped making sense.
+      placeholder: |
+        I wanted to point the CLI at a non-production environment, but I could not tell from
+        `nxis --help` whether that was possible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: What you tried
+      description: Commands, output, or the documentation you were reading. Optional.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: CLI version
+      description: Output of `nxis --version`, if it is relevant.
+      placeholder: "0.1.0"
+    validations:
+      required: false

@@ -1,0 +1,32 @@
+# Installs and tests the formula on each change, on the platforms it supports. Written by
+# release/formula.mjs in nxisai/cli; edit it there.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@63a2d4d8d4193eab3e62b1b782ff3ab8408f5b29 # main, 2026-11-06
+      - name: Audit
+        run: brew audit --strict --online --formula nxisai/cli/nxis
+      - name: Install
+        run: brew install --formula nxisai/cli/nxis
+      - name: Test
+        run: brew test nxisai/cli/nxis
+      - name: It knows Homebrew installed it
+        run: |
+          nxis update --check --json | tee update.json
+          grep -q '"how": "brew upgrade nxis"' update.json

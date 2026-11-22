@@ -1,0 +1,82 @@
+name: Bug report
+description: A command failed, hung, or did the wrong thing.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. If this is a **security** problem, please close this and use
+        [SECURITY.md](https://github.com/nxisai/cli/blob/main/SECURITY.md) instead — it has a
+        private channel.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+      placeholder: |
+        I ran `nxis subscribe free` and expected it to activate the plan.
+        It waited for a payment that never came, then exited 2.
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The command, and what it printed
+      description: >
+        Paste the command and its output. Adding `--json` often makes the failure clearer.
+        Rendered as a code block, so no backticks needed.
+      render: shell
+      placeholder: |
+        $ nxis subscribe free --json
+        { "ok": false, "reason": "...", "error": "..." }
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: CLI version
+      description: Output of `nxis --version`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: "macOS 15.2, arm64 — or Ubuntu 24.04, x86_64, inside Docker"
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: Output of `node --version`. The CLI needs 20 or later.
+      placeholder: "v22.11.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Anything unusual about the environment
+      description: >
+        Optional, but often the answer. A headless server, no OS keychain, a proxy, an unusual
+        shell, a CI runner, or any `NXIS_` variables you have set.
+      placeholder: "Running over SSH with no browser; NXIS_NO_BROWSER=1 set."
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: no-secrets
+    attributes:
+      label: Before you post
+      options:
+        - label: >
+            I have checked that the output above contains no access token, API key or other
+            credential. (The CLI redacts what it can, but paste carefully.)
+          required: true

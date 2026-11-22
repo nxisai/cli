@@ -1,0 +1,8 @@
+# Keeps the commit-SHA pins in the workflows current. Actions are pinned to a SHA so a moved
+# tag cannot change what runs; Dependabot proposes the update as a reviewable pull request.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

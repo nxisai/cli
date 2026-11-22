@@ -1,0 +1,319 @@
+########################################################################
+# Publishes @nxisai/cli to npm, and the standalone release to this tag's
+# GitHub release and the Homebrew tap, from the public mirror only, once
+# approved.
+#
+# Runs on the version tag the Mirror release workflow pushes. The release
+# is checked first; the npm job then waits in the `npm` environment for a
+# person to approve it, the way yaaa-io/yaaa releases. It holds no npm
+# token: npm trusts this workflow (trusted publishing) and records where
+# the version came from (provenance).
+#
+# Set up once, in nxisai/cli:
+# - An `npm` environment, with a deployment rule allowing tags `v*.*.*`.
+# - A repository variable NXIS_AUTH_CLIENT_ID: the public OAuth client id
+#   the build embeds. The publish refuses to run without it.
+# - npmjs.com: a trusted publisher for @nxisai/cli, naming nxisai/cli, this
+#   workflow file and the `npm` environment.
+# - In the `npm` environment, the secret NXIS_RELEASE_SIGNING_KEY: the
+#   Ed25519 private key (PEM) whose public key is pinned in
+#   src/release-keys.ts. The standalone release is signed with it.
+# - In the `npm` environment, the secret HOMEBREW_TAP_DEPLOY_KEY: the
+#   private half of a deploy key with write access to nxisai/homebrew-cli.
+#   The tap job runs only when the repository variable HOMEBREW_TAP_ENABLED
+#   is `true`; until then it is skipped.
+# docs/releasing.md has the commands.
+#
+# The standalone release is built and run on each platform with no
+# secrets, then signed and attached to the GitHub release in the `npm`
+# environment, so one approval covers npm, the GitHub release and the tap.
+# While the repository is private the GitHub release is still made (its
+# files need authentication to download until it is public), and the
+# formula is written but not pushed.
+#
+# The approval is the `npm` environment's required reviewers. GitHub only
+# offers them in public repositories on this plan, so they are added when
+# nxisai/cli goes public, BEFORE the next tag: until they are, a real
+# release publishes without waiting for anyone. While the repository is
+# private nothing is uploaded (see below), so nothing needs approving.
+#
+# A pre-release version (0.1.0-beta.1) goes to the dist-tag named by its
+# first pre-release identifier (beta); a plain version, to latest.
+#
+# While nxisai/cli is private, the approved job is a rehearsal: it builds
+# and runs `npm publish --dry-run`. npm generates provenance only for public
+# repositories, and a version published without it cannot be published
+# again with it, so nothing is uploaded until the repository is public.
+########################################################################
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check the release
+    if: github.repository == 'nxisai/cli'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      dist_tag: ${{ steps.v.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - id: v
+        name: The tag and package.json agree
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME but package.json is $version"; exit 1
+          fi
+          case "$version" in
+            *-*) prerelease="${version#*-}"; dist_tag="${prerelease%%.*}" ;;
+            *) dist_tag=latest ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  npm:
+    name: npm (@nxisai/cli)
+    needs: check
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Publish
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          DIST_TAG: ${{ needs.check.outputs.dist_tag }}
+          NXIS_AUTH_CLIENT_ID: ${{ vars.NXIS_AUTH_CLIENT_ID }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships npm 10.
+          npm install -g npm@^11.5.1 --no-fund --no-audit
+          if npm view "@nxisai/cli@$VERSION" version >/dev/null 2>&1; then
+            echo "@nxisai/cli@$VERSION is already on npm"; exit 0
+          fi
+          if [ "$REPOSITORY_PRIVATE" = "true" ]; then
+            echo "::notice::nxisai/cli is private, so this is a rehearsal: nothing is uploaded."
+            npm publish --dry-run --access public --tag "$DIST_TAG"
+          else
+            npm publish --provenance --access public --tag "$DIST_TAG"
+          fi
+
+  # The standalone release: per-platform tarballs with Node.js, the CLI bundled into one file, and
+  # the installer. Built once, here, with no secrets; nothing is signed or uploaded yet.
+  standalone-build:
+    name: standalone build
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Build every platform
+        env:
+          NXIS_AUTH_CLIENT_ID: ${{ vars.NXIS_AUTH_CLIENT_ID }}
+        run: |
+          node scripts/build-config.mjs --require
+          node release/build.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: standalone
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 7
+
+  # Each tarball, unpacked and started on its own platform with no node on PATH, before it's signed.
+  standalone-smoke:
+    name: standalone ${{ matrix.platform }}
+    needs: standalone-build
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: macos-latest, platform: darwin-arm64 }
+          - { os: macos-15-intel, platform: darwin-x64 }
+          - { os: ubuntu-latest, platform: linux-x64 }
+          - { os: ubuntu-24.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: standalone
+          path: dist/release
+      - run: sh release/smoke-tarball.sh dist/release/download/v*/nxis-*-${{ matrix.platform }}.tar.gz
+
+  # Signs the release and attaches it to this tag's GitHub release, behind the same approval as
+  # npm. The release is made as a draft, filled, then published and marked latest, so the
+  # releases/latest redirect never leads to a release with files missing. A version is published
+  # once: a release that exists already is left as it is.
+  standalone-release:
+    name: GitHub release (standalone)
+    needs: [check, standalone-smoke]
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: write # the release and its files
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: standalone
+          path: dist/release
+
+      - id: exists
+        name: Is it released already?
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft -q '.isDraft' 2>/dev/null | grep -qx false; then
+            echo "v$VERSION is already released; nothing to do."
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The private key is only ever in a file for this step, readable by this user alone.
+      - name: Sign
+        if: steps.exists.outputs.released == 'false'
+        env:
+          NXIS_RELEASE_SIGNING_KEY: ${{ secrets.NXIS_RELEASE_SIGNING_KEY }}
+        run: |
+          set -eu
+          [ -n "$NXIS_RELEASE_SIGNING_KEY" ] || { echo "::error::NXIS_RELEASE_SIGNING_KEY is not set (see docs/releasing.md)"; exit 1; }
+          key="$RUNNER_TEMP/release-signing-key.pem"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$NXIS_RELEASE_SIGNING_KEY" > "$key")
+          NXIS_RELEASE_SIGNING_KEY_FILE="$key" node release/sign.mjs
+
+      - name: Check it
+        if: steps.exists.outputs.released == 'false'
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -eu
+          node release/verify.mjs
+          node scripts/release-notes.mjs "$VERSION" > "$RUNNER_TEMP/notes.md"
+          node release/check-public.mjs dist/release "$RUNNER_TEMP/notes.md"
+
+      - name: Publish the GitHub release
+        if: steps.exists.outputs.released == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -eu
+          tag="v$VERSION"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --title "nxis $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber dist/release/download/"$tag"/*
+          # Not marked a pre-release even for a beta: GitHub's releases/latest, which the installer
+          # and nxis update follow, skips pre-releases.
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  # The Homebrew formula, written from the signed manifest and pushed to the tap. While nxisai/cli
+  # is private, its release files need authentication, so a formula would not install: it is
+  # written and printed, and not pushed.
+  #
+  # Off until the tap exists: the job runs only when the repository variable HOMEBREW_TAP_ENABLED
+  # is `true`. Without it the job is skipped, and npm and the GitHub release are unaffected.
+  homebrew:
+    name: Homebrew (nxisai/homebrew-cli)
+    needs: [check, standalone-release]
+    if: vars.HOMEBREW_TAP_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Download the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          mkdir -p "dist/release/download/v$VERSION"
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --dir "dist/release/download/v$VERSION" \
+            --pattern manifest.json --pattern manifest.json.sig
+
+      - name: Write the formula
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          node release/formula.mjs --dir dist/release --version "$VERSION" | tee "$RUNNER_TEMP/nxis.rb"
+          node release/check-public.mjs "$RUNNER_TEMP/nxis.rb" release/homebrew
+
+      - name: Push it to the tap
+        if: github.event.repository.private == false
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          VERSION: ${{ needs.check.outputs.version }}
+          # GitHub's published ed25519 host key fingerprint:
+          # https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+          GITHUB_ED25519: SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
+        run: |
+          set -eu
+          [ -n "$HOMEBREW_TAP_DEPLOY_KEY" ] || { echo "::error::HOMEBREW_TAP_DEPLOY_KEY is not set (see docs/releasing.md)"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/tap && chmod 600 ~/.ssh/tap
+          ssh-keyscan -t ed25519 github.com 2>/dev/null > ~/.ssh/known_hosts
+          ssh-keygen -lf ~/.ssh/known_hosts | grep -q "$GITHUB_ED25519" \
+            || { echo "::error::github.com's host key does not match the published fingerprint"; exit 1; }
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/tap -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          git clone --quiet git@github.com:nxisai/homebrew-cli.git tap
+          node release/formula.mjs --dir dist/release --version "$VERSION" --tap tap
+          cd tap
+          git add -A
+          if git diff --cached --quiet; then echo "the tap already has nxis $VERSION"; exit 0; fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "nxis $VERSION"
+          git push --quiet origin HEAD:main
+
+      - name: Not pushed while the repository is private
+        if: github.event.repository.private == true
+        run: echo "::notice::nxisai/cli is private, so the formula above is not pushed to nxisai/homebrew-cli."

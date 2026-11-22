@@ -1,0 +1,11 @@
+{
+    "specVersion": "draft",
+    "entries": [
+        {
+            "identifier": "urn:air:example.com:nxis:example",
+            "displayName": "Example Outfitters data (renamed by us)",
+            "mediaType": "application/mcp-server-card+json",
+            "url": "https://old-host.example.org/mcp/server-card"
+        }
+    ]
+}

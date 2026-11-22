@@ -1,0 +1,15 @@
+{
+  "specVersion": "1.0",
+  "host": {
+    "identifier": "urn:air:example.com",
+    "displayName": "Example Outfitters (our name)"
+  },
+  "entries": [
+    {
+      "identifier": "urn:air:example.com:other-tool:chat",
+      "type": "application/a2a-agent-card+json",
+      "displayName": "Our chat agent",
+      "url": "https://chat.example.net/agent-card"
+    }
+  ]
+}
