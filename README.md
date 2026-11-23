@@ -204,10 +204,14 @@ nxis keys create --scope content_gaps:report
 nxis keys list [--all]           The current site's keys you created
 nxis keys revoke <key-id>        Revoke a key
 nxis agents status               The site's hosted agents: on or off, kill switch, policy version, notices
-nxis agents enable page|support [--label <text>] [--description <text>] [--example <q>]... [--model <id>]
-nxis agents disable page|support
-nxis agents pause [page|support] [--tools] [--reason <text>]
-nxis agents resume [page|support]
+nxis agents catalog [--job <job>]... [--industry <name>]... [--readiness <r>]... [--added|--not-added] [--query <words>] [--by-fit]
+                                 The agents NxisAI offers, how well each fits the site, and what each still needs
+nxis agents catalog <id>         One agent: its settings as flags, with their limits, what it needs, and its enable line
+nxis agents enable <id> [--<setting> <value>]... [--connection <name|id>]
+nxis agents configure <id> [--<setting> <value>]... [--clear <setting>]...
+nxis agents disable <id>
+nxis agents pause [<id>] [--tools] [--reason <text>]
+nxis agents resume [<id>]
 nxis agents brand [--name <text>] [--logo <https url>] [--accent <#rrggbb>] [--privacy-url <https url>] [--clear name|logo|accent|privacy-url]...
 nxis agents policy set <file.json | ->
 nxis agents policy show [--instructions]
@@ -249,7 +253,10 @@ Options:
 | `--filter path=op:value` | `query`: a field filter; repeatable |
 | `--scope <scope>` | `keys create`: what the key may do; `content_gaps:report` is the only scope so far |
 | `--all` | `keys list`: include revoked keys |
-| `--label`, `--description`, `--example <q>`, `--model <id>` | `agents enable`: the Support Agent's label, description and example questions (`--example` repeats), and either agent's model |
+| `--<setting> <value>` | `agents enable` and `agents configure`: one of the agent's settings, by the flag `agents catalog <id>` lists (`--label`, `--description`, `--example <q>`, `--model <id>`, `--slot-minutes <n>` …); a list setting repeats (`--example a --example b`) and replaces the list |
+| `--connection <name\|id>` | `agents enable`: route the agent's requests through this connection, for an agent that sends requests to the site (Quote, Booking) |
+| `--clear <setting>` | `agents configure`: return a setting to its default (repeats) |
+| `--job`, `--industry`, `--readiness`, `--added`, `--not-added`, `--query`, `--by-fit` | `agents catalog`: filter by job, industry or readiness (`available`, `early_access`, `coming_soon`; each repeats), by whether the site has added the agent, by words, and order by fit |
 | `--name <text>`, `--logo <url>`, `--accent <#rrggbb>`, `--privacy-url <url>`, `--clear <part>` | `agents brand`: the chat's name, logo, accent color and privacy page; `--clear name\|logo\|accent\|privacy-url` resets one (repeats) |
 | `--tools`, `--reason <text>` | `agents pause`: pause actions only (tools that change something; answers and read-only lookups go on); what visitors are told |
 | `--limit <n>`, `--page-token <t>` | `agents transcripts list`: page size (1 to 100, default 25) and the page to read |
@@ -371,18 +378,26 @@ MCP keys.
 
 ## Hosted agents
 
-A site can run two hosted agents: the on-page assistant (the chat on your pages) and the Support
-Agent, which answers from the site's MCP server. `nxis agents` turns them on and off, pauses them,
-brands the chat, sets their guardrails policy, and accepts the data processing agreement that going live needs.
-Changes reach the site within seconds.
+A site can run the hosted agents NxisAI offers: the on-page assistant (the chat on your pages),
+the Support Agent, which answers from the site's MCP server, Quote and Booking, which send
+requests to the site's own servers through a connection, and any agent NxisAI adds later. Each has
+an id in the agent catalog (`page`, `support`, `quote`, `booking` …). `nxis agents` turns them on
+and off, configures and pauses them, brands the chat, sets their guardrails policy, and accepts the
+data processing agreement that going live needs. The NxisAI API serves every one of these commands,
+and changes reach the site within seconds.
 
 ```
 nxis agents status                       What runs on the current site
+nxis agents catalog [--by-fit]           The agents NxisAI offers, and how well each fits the site
+nxis agents catalog quote                Quote's settings as flags, with their limits, what it needs, and its enable line
 nxis agents enable page [--model <id>]
 nxis agents enable support --label "Help" [--description <text>] [--example "Do you ship to Canada?"]... [--model <id>]
-nxis agents disable page|support         Turn one off; its settings are kept
-nxis agents pause [page|support] [--tools] [--reason <text>]
-nxis agents resume [page|support]
+nxis agents enable quote --label "Get a quote" --connection Website
+nxis agents enable booking --label "Book a visit" --slot-minutes 60 --connection Website
+nxis agents configure booking --lead-minutes 240 --clear description
+nxis agents disable <id>                 Turn one off; its settings are kept
+nxis agents pause [<id>] [--tools] [--reason <text>]
+nxis agents resume [<id>]
 nxis agents brand --name "Wrenfield" --logo https://example.com/logo-mark.svg --accent "#C73A17" --privacy-url https://example.com/privacy/
 nxis agents brand --clear logo        Back to the default mark
 nxis agents policy set policy.json       Or `-` to read it from stdin
@@ -391,14 +406,44 @@ nxis agents dpa                          The data processing agreement, and whet
 nxis agents dpa accept [--entity <name>] [--yes]  Accept its current version
 ```
 
+**Each agent's settings come from the catalog.** `nxis agents catalog <id>` lists them as flags,
+with their type, limits and whether they are required, and prints the shortest `enable` line that
+works. The CLI reads them from the service each time, so an agent NxisAI starts hosting works
+without updating the CLI. The flags are checked before anything is sent, as the service checks
+them, with lengths counted in UTF-16 code units as the service counts them. In a reason, a
+flag's `-` is written `_`:
+
+| Reason | Exit | When |
+|---|---|---|
+| `missing_<flag>` | 1 | A required setting would be empty (`missing_label`) |
+| `<flag>_too_long` | 1 | Longer than its limit (`label_too_long`, `description_too_long`, `example_too_long`), with `limit` and `length` |
+| `too_many_<setting>` | 1 | A list with too many items (`too_many_examples`), with `limit` and `count` |
+| `invalid_<flag>` | 1 | Out of range, not one of its values, not an https URL, not a color, an empty or repeated item (`invalid_slot_minutes`), with `rule` and `min`/`max` or `allowed` |
+| `unknown_flag` | 1 | A flag that isn't one of the agent's settings, with `allowed` |
+| `model_retired` | 1 | A model no longer offered, with `allowed` |
+| `unknown_agent`, `agent_not_hosted` | 1 | No agent has that id, or NxisAI doesn't host it yet |
+| `connection_required` | 2 | The agent needs a connection and has none: `connections` lists the site's by name; run it again with `--connection <name>` |
+| `connection_not_found`, `connection_unusable` | 2 | `--connection` names none of the site's connections, or its route can't be sent through |
+| `records_missing` | 2 | The site's records lack what the agent needs (Quote: prices; Booking: services), with `types` |
+| `actions_off` | 2 | The site's actions are turned off (`nxis actions on`) |
+| `opening_hours_required` | 2 | Booking from opening hours, and the site has none set |
+| `version_conflict` | 1 | Someone else changed the settings, after one automatic retry |
+| `hosted_agents_unavailable` | 1 | This NxisAI environment can't turn that agent on from the CLI yet |
+
+`enable` and `configure` print `agent: {id, enabled, state, state_reason, settings, kill_switch,
+effective_kill_switch, prerequisites}` and `changed`; for `page` and `support` they also print
+every key they always did. `state` is `off`, `needs_setup`, `preview`, `paused` or `live`. An
+agent that is on but doesn't answer visitors yet (the Support Agent without an MCP server, say)
+still exits 0, with `state: "needs_setup"`, the reason in `state_reason`, and a `next` line.
+`configure` changes settings without turning the agent on or off; `--clear <setting>` returns one
+to its default. `status --json` adds `agents`, one entry per hosted agent.
+
 **The Support Agent needs a label**, the name a visitor reads: `--label`, or the one already set
-(`missing_label` otherwise). `--example` repeats and replaces the example questions. The limits are
-checked before anything is sent: a label of at most 100 characters, a description of at most 300,
-up to 10 examples of at most 200, and a pause reason of at most 200. Without an MCP server the
-Support Agent stays off, and `status` says so.
+(`missing_label` otherwise). `--example` repeats and replaces the example questions: up to 10, of
+at most 200 characters each. A pause reason is at most 200 characters.
 
 **`pause` is the kill switch.** It refuses every turn, or with `--tools` only the turns that would
-use tools; `--reason` is what visitors are told. `pause page` or `pause support` pauses that agent
+use tools; `--reason` is what visitors are told. `pause <id>` (`pause support`, `pause quote`) pauses that agent
 only; with no agent named, it pauses every hosted agent on the site. An agent is held to the
 stricter of its own pause and the site's. `resume` turns off the one it names, or the site-wide
 switch with none named; each is separate, so `status` shows any agent still paused by name.

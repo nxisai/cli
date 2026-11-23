@@ -37,8 +37,10 @@ export interface Parsed {
  * `--json orgs` from `--org acme`, so every new boolean flag has to be added here.
  */
 export const BOOLEAN_FLAGS = new Set([
+  "added",
   "all",
   "allow-unconfirmed",
+  "by-fit",
   "check",
   "default",
   "dev",
@@ -53,6 +55,7 @@ export const BOOLEAN_FLAGS = new Set([
   "json",
   "keep-secret",
   "no-open",
+  "not-added",
   "off",
   "on",
   "preview",

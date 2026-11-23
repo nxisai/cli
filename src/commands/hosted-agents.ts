@@ -1,7 +1,13 @@
 /**
- * `nxis agents` — a site's hosted agents: the on-page assistant and the Support Agent.
+ * `nxis agents` — a site's hosted agents: the on-page assistant, the Support Agent, and every other
+ * agent NxisAI hosts, by its catalog id.
  *
  * @remarks
+ * `enable`, `configure`, `disable`, `pause` and `resume` with an id act on one agent through the
+ * hosted agent calls (`agents-by-id.ts`), with flags read from the agent's own setup. What follows
+ * is the older path, which `page` and `support` keep against a service without those calls, and
+ * which the site-wide pause, `brand` and `policy` use.
+ *
  * Each write reads the site's agent config, changes one thing, and writes the whole config back
  * with the version it read, so every setting the command does not touch stays exactly as it was.
  * When the config already says what was asked, nothing is sent and the result says
@@ -53,6 +59,19 @@ import { getAgentSetup, dpaBaseUrl, dpaUrl, type AgentSetup } from "../api/agent
 import { cmdAgentsDpa, cmdAgentsDpaAccept, dpaState } from "./agents-dpa.js";
 import { terminalAsker, type Asker } from "../prompt.js";
 import { runTranscripts } from "./transcripts.js";
+import { listHostedAgents, type HostedAgentList } from "../api/hosted-agents.js";
+import {
+  agentJson,
+  clearFlags,
+  cmdAgentConfigure,
+  cmdAgentDisable,
+  cmdAgentEnable,
+  cmdAgentPause,
+  cmdAgentResume,
+  cmdAgentsCatalog,
+  cmdAgentsCatalogEntry,
+  LEGACY_AGENTS,
+} from "./agents-by-id.js";
 
 /** The service's limits, checked here first so the error names the flag. */
 export const LIMITS = {
@@ -66,10 +85,12 @@ export const LIMITS = {
 /** Usage, per subcommand. */
 const USAGE = {
   status: "`nxis agents status`",
-  enable: "`nxis agents enable page|support [--label <text>] [--description <text>] [--example <q>]... [--model <id>]`",
-  disable: "`nxis agents disable page|support`",
-  pause: "`nxis agents pause [page|support] [--tools] [--reason <text>]`",
-  resume: "`nxis agents resume [page|support]`",
+  catalog: "`nxis agents catalog [<id>]`",
+  enable: "`nxis agents enable <id> [--<setting> <value>]... [--connection <name|id>]`",
+  configure: "`nxis agents configure <id> [--<setting> <value>]... [--clear <setting>]...`",
+  disable: "`nxis agents disable <id>`",
+  pause: "`nxis agents pause [<id>] [--tools] [--reason <text>]`",
+  resume: "`nxis agents resume [<id>]`",
   brand:
     "`nxis agents brand [--name <text>] [--logo <https url>] [--accent <#rrggbb>] [--privacy-url <https url>] " +
     "[--clear name|logo|accent|privacy-url]...`",
@@ -78,8 +99,13 @@ const USAGE = {
   dpa: "`nxis agents dpa` or `nxis agents dpa accept [--entity <name>] [--yes]`",
 } as const;
 
-/** Which hosted agent a subcommand acts on. */
+/** The hosted agents the older path knows. */
 export type HostedAgent = "page" | "support";
+
+/** @returns True for `page` and `support`. */
+function isLegacy(id: string): id is HostedAgent {
+  return LEGACY_AGENTS.has(id);
+}
 
 /**
  * Dispatches `nxis agents <sub> …`.
@@ -95,40 +121,64 @@ export async function runHostedAgents(ctx: Ctx, args: string[], flags: Flags, as
     case "status":
       await cmdAgentsStatus(ctx);
       return;
+    case "catalog":
+      if (target === undefined) await cmdAgentsCatalog(ctx, flags);
+      else await cmdAgentsCatalogEntry(ctx, target.trim());
+      return;
     case "enable":
+    case "configure":
     case "disable": {
-      if (target !== "page" && target !== "support") {
-        throw failed(`Which agent? ${USAGE[sub]}.`, "missing_agent");
+      if (target === undefined || !target.trim()) {
+        throw failed(`Which agent? ${USAGE[sub]}; \`nxis agents catalog\` lists them.`, "missing_agent");
       }
+      const id = target.trim();
+      const fallback = { unknownReason: "missing_agent", usage: USAGE[sub] };
       if (sub === "disable") {
-        await cmdAgentsDisable(ctx, target);
+        await cmdAgentDisable(ctx, id, { ...fallback, ...(isLegacy(id) ? { legacy: () => cmdAgentsDisable(ctx, id) } : {}) });
         return;
       }
-      const label = str(flags, "label");
-      const description = str(flags, "description");
-      const model = str(flags, "model");
-      const examples = list(flags, "example");
-      await cmdAgentsEnable(ctx, target, {
-        ...(label !== undefined ? { label } : {}),
-        ...(description !== undefined ? { description } : {}),
-        ...(model !== undefined ? { model } : {}),
-        ...(examples.length > 0 ? { examples } : {}),
+      if (sub === "configure") {
+        await cmdAgentConfigure(ctx, id, flags, {
+          ...fallback,
+          ...(isLegacy(id) ? { legacy: () => cmdAgentsConfigure(ctx, id, legacySettings(flags), clearFlags(flags)) } : {}),
+        });
+        return;
+      }
+      await cmdAgentEnable(ctx, id, flags, {
+        ...fallback,
+        ...(isLegacy(id) ? { legacy: () => cmdAgentsEnable(ctx, id, legacySettings(flags)) } : {}),
       });
       return;
     }
     case "pause": {
-      const agent = optionalAgent(sub, target);
       const reason = str(flags, "reason");
-      await cmdAgentsPause(ctx, {
-        tools: bool(flags, "tools"),
-        ...(reason !== undefined ? { reason } : {}),
-        ...(agent ? { agent } : {}),
+      const tools = bool(flags, "tools");
+      if (target === undefined) {
+        await cmdAgentsPause(ctx, { tools, ...(reason !== undefined ? { reason } : {}) });
+        return;
+      }
+      const id = target.trim();
+      const args = { tools, ...(reason !== undefined ? { reason } : {}) };
+      await cmdAgentPause(ctx, id, args, {
+        unknownReason: "unknown_agent",
+        usage: USAGE.pause,
+        ...(isLegacy(id) ? { legacy: () => cmdAgentsPause(ctx, { ...args, agent: id }) } : {}),
       });
       return;
     }
-    case "resume":
-      await cmdAgentsResume(ctx, optionalAgent(sub, target));
+    case "resume": {
+      if (target === undefined) {
+        await cmdAgentsResume(ctx);
+        return;
+      }
+      const id = target.trim();
+      await cmdAgentResume(ctx, id, {
+        unknownReason: "unknown_agent",
+        usage: USAGE.resume,
+        ...(isLegacy(id) ? { legacy: () => cmdAgentsResume(ctx, id) } : {}),
+      });
       return;
+    }
     case "brand":
       await cmdAgentsBrand(ctx, brandArgs(flags));
       return;
@@ -161,21 +211,26 @@ export async function runHostedAgents(ctx: Ctx, args: string[], flags: Flags, as
     }
     default:
       throw new CliError(
-        `Try ${USAGE.status}, ${USAGE.enable}, ${USAGE.disable}, ${USAGE.pause}, ${USAGE.resume}, ${USAGE.brand}, ${USAGE.policy}, ` +
+        `Try ${USAGE.status}, ${USAGE.catalog}, ${USAGE.enable}, ${USAGE.configure}, ${USAGE.disable}, ${USAGE.pause}, ` +
+          `${USAGE.resume}, ${USAGE.brand}, ${USAGE.policy}, ` +
           `${USAGE.transcripts} or ${USAGE.dpa}.`,
         { reason: "unknown_command" },
       );
   }
 }
 
-/**
- * @returns The agent `pause` or `resume` names, or undefined for the whole site.
- * @throws CliError `unknown_agent` (exit 1) for anything but `page` or `support`.
- */
-function optionalAgent(sub: "pause" | "resume", target: string | undefined): HostedAgent | undefined {
-  if (target === undefined) return undefined;
-  if (target === "page" || target === "support") return target;
-  throw failed(`There is no hosted agent called "${plainText(target)}". ${USAGE[sub]}.`, "unknown_agent");
+/** The settings `enable` and `configure` have always taken, for the older path. */
+function legacySettings(flags: Flags): EnableArgs {
+  const label = str(flags, "label");
+  const description = str(flags, "description");
+  const model = str(flags, "model");
+  const examples = list(flags, "example");
+  return {
+    ...(label !== undefined ? { label } : {}),
+    ...(description !== undefined ? { description } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(examples.length > 0 ? { examples } : {}),
+  };
 }
 
 /** The organization, site and token a command acts with. */
@@ -223,6 +278,13 @@ export async function cmdAgentsStatus(ctx: Ctx): Promise<void> {
   } catch {
     setup = null;
   }
+  // Every hosted agent by id, from a service that has them; left out against one that doesn't.
+  let hosted: HostedAgentList | null = null;
+  try {
+    hosted = await listHostedAgents({ config: ctx.config, token: t.token, orgId: t.orgId, siteId: t.siteId });
+  } catch {
+    hosted = null;
+  }
   const base = dpaBaseUrl();
   const blocker = goLiveBlocker(config, setup);
   const waiting = waitingOnDpa(config, setup);
@@ -246,9 +308,21 @@ export async function cmdAgentsStatus(ctx: Ctx): Promise<void> {
         : null,
       go_live_blocked_by: blocker,
       notices: notices?.map(noticeJson) ?? null,
+      ...(hosted ? { agents: hosted.agents.map(agentJson) } : {}),
     },
-    () => `${summary(t, config)}\n${goLiveLine(config, setup, blocker, base)}` + noticesText(notices),
+    () => `${summary(t, config)}\n${goLiveLine(config, setup, blocker, base)}` + hostedText(hosted) + noticesText(notices),
   );
+}
+
+/** Each hosted agent and where it stands, under the status; nothing without them. */
+function hostedText(hosted: HostedAgentList | null): string {
+  if (!hosted?.agents.length) return "";
+  const rows = hosted.agents.map((a) => {
+    const state = a.state ? a.state.replace(/_/g, " ") : a.enabled ? "on" : "off";
+    const why = a.state !== "live" && a.state !== "off" && a.stateMessage ? `: ${plainText(a.stateMessage)}` : "";
+    return `  ${plainText(a.displayName || a.agent).padEnd(18)} ${dim(plainText(a.agent))} ${state}${why}`;
+  });
+  return "\n\nBy catalog id (`nxis agents catalog <id>` for one)\n" + rows.join("\n");
 }
 
 /** A notice in `--json` results. */
@@ -350,6 +424,7 @@ export async function cmdAgentsEnable(ctx: Ctx, agent: HostedAgent, args: Enable
   checkLength("--description", description, LIMITS.description, "description_too_long");
   if (examples && examples.length > LIMITS.examples) {
     throw failed(`At most ${LIMITS.examples} --example questions (got ${examples.length}).`, "too_many_examples", {
+      flag: "--example",
       limit: LIMITS.examples,
       count: examples.length,
     });
@@ -363,6 +438,7 @@ export async function cmdAgentsEnable(ctx: Ctx, agent: HostedAgent, args: Enable
       throw failed(
         "The Support Agent needs a label, the name a visitor reads. Pass --label <text>.",
         "missing_label",
+        { flag: "--label", setting: "label" },
       );
     }
     return {
@@ -379,12 +455,16 @@ export async function cmdAgentsEnable(ctx: Ctx, agent: HostedAgent, args: Enable
   });
 }
 
-/** @throws CliError with `reason` when the value is longer than `limit` characters. */
+/**
+ * @throws CliError with `reason` when the value is longer than `limit` characters, counted in
+ * UTF-16 code units, as the service counts them.
+ */
 function checkLength(flag: string, value: string | undefined, limit: number, reason: string): void {
-  if (value !== undefined && [...value].length > limit) {
-    throw failed(`${flag} is at most ${limit} characters (got ${[...value].length}).`, reason, {
+  if (value !== undefined && value.length > limit) {
+    throw failed(`${flag} is at most ${limit} characters (got ${value.length}).`, reason, {
+      flag,
       limit,
-      length: [...value].length,
+      length: value.length,
     });
   }
 }
@@ -395,6 +475,51 @@ function checkLength(flag: string, value: string | undefined, limit: number, rea
  */
 export async function cmdAgentsDisable(ctx: Ctx, agent: HostedAgent): Promise<void> {
   await write(ctx, (s) => ({ ...s, [agent]: { ...s[agent], enabled: false } }));
+}
+
+/**
+ * Runs `nxis agents configure page|support` on the older path: settings, without turning the agent
+ * on or off. A cleared setting returns to its default (empty).
+ *
+ * @throws CliError the limits of {@link cmdAgentsEnable}, and `missing_label` when the Support
+ * Agent is on and would have no label.
+ */
+export async function cmdAgentsConfigure(ctx: Ctx, agent: HostedAgent, args: EnableArgs, clear: string[] = []): Promise<void> {
+  const label = args.label?.trim();
+  const description = args.description?.trim();
+  const examples = args.examples?.map((e) => e.trim()).filter((e) => e.length > 0);
+  checkLength("--label", label, LIMITS.label, "label_too_long");
+  checkLength("--description", description, LIMITS.description, "description_too_long");
+  if (examples && examples.length > LIMITS.examples) {
+    throw failed(`At most ${LIMITS.examples} --example questions (got ${examples.length}).`, "too_many_examples", {
+      flag: "--example",
+      limit: LIMITS.examples,
+      count: examples.length,
+    });
+  }
+  for (const example of examples ?? []) checkLength("--example", example, LIMITS.example, "example_too_long");
+  const cleared = new Set(clear);
+  await write(ctx, (s) => {
+    const current = s[agent] ?? {};
+    const next: Record<string, unknown> = { ...current };
+    if (args.model !== undefined) next["model"] = args.model.trim();
+    if (cleared.has("model")) next["model"] = "";
+    if (agent === "support") {
+      if (label !== undefined) next["label"] = label;
+      if (description !== undefined) next["description"] = description;
+      if (examples !== undefined) next["examples"] = examples;
+      if (cleared.has("label")) next["label"] = "";
+      if (cleared.has("description")) next["description"] = "";
+      if (cleared.has("example")) next["examples"] = [];
+      if (next["enabled"] === true && !String(next["label"] ?? "").trim()) {
+        throw failed("The Support Agent needs a label, the name a visitor reads. Pass --label <text>.", "missing_label", {
+          flag: "--label",
+          setting: "label",
+        });
+      }
+    }
+    return { ...s, [agent]: next };
+  });
 }
 
 /** Options for `nxis agents pause`. */
@@ -799,7 +924,7 @@ function killJson(kill: KillSwitchView | null): { scope: "agent" | "tools"; reas
 }
 
 /** The `--json` result for a config. */
-function statusJson(t: Target, config: AgentConfig): Record<string, unknown> {
+export function statusJson(t: Target, config: AgentConfig): Record<string, unknown> {
   const page = pageOf(config.settable);
   const support = supportOf(config.settable);
   const kill = killSwitchOf(config.settable);
@@ -869,7 +994,7 @@ export function transcriptsLine(s: SettableConfig): string {
 }
 
 /** The human summary of a config. */
-function summary(t: Target, config: AgentConfig): string {
+export function summary(t: Target, config: AgentConfig): string {
   const page = pageOf(config.settable);
   const support = supportOf(config.settable);
   const kill = killSwitchOf(config.settable);

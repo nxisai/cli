@@ -126,7 +126,7 @@ Site keys (for software on the site's own server that needs one narrow write)
   keys list [--all]          The current site's keys you created; --all includes revoked ones
   keys revoke <key-id>       Revoke a key; it stops working on its next use
 
-Hosted agents (the on-page assistant and the Support Agent; changes reach the site within seconds)
+Hosted agents (by catalog id: page, support, quote, booking ...; changes reach the site within seconds)
   agents status              What runs on the current site: each agent, the chat's branding, the
                              kill switch, the policy version, the verified hosts, what holds
                              back going live, and any notices
@@ -138,18 +138,26 @@ Hosted agents (the on-page assistant and the Support Agent; changes reach the si
   agents dpa accept --site <id> --entity <name>
                              Accept it for a site that belongs to a different legal entity than
                              your organization: that entity accepts, for that site only
-  agents enable page|support [--label <text>] [--description <text>] [--example <q>]...
-                [--model <id>]
-                             Turn an agent on; the Support Agent needs a label. --example
-                             repeats, and replaces the example questions
-  agents disable page|support
-                             Turn an agent off, keeping its settings
-  agents pause [page|support] [--tools] [--reason <text>]
+  agents catalog [--job <job>]... [--industry <name>]... [--readiness <r>]...
+                 [--added|--not-added] [--query <words>] [--by-fit]
+                             The agents NxisAI offers: fit, readiness, whether NxisAI hosts it,
+                             whether the site has it, and what it still needs
+  agents catalog <id>        One agent: its settings as flags with their limits, what it needs,
+                             and the enable line that works
+  agents enable <id> [--<setting> <value>]... [--connection <name|id>]
+                             Turn an agent on (page, support, quote, booking ...), with any of its
+                             settings: page|support take --label, --description, --example
+                             (repeats, replaces the list) and --model, as \`agents catalog <id>\`
+                             lists. --connection routes its requests (Quote, Booking); exit 2
+                             connection_required lists the site's connections
+  agents configure <id> [--<setting> <value>]... [--clear <setting>]...
+                             Change an agent's settings without turning it on or off
+  agents disable <id>        Turn an agent off, keeping its settings
+  agents pause [<id>] [--tools] [--reason <text>]
                              Kill switch: refuse every turn, or with --tools only actions
                              (tools that change something); --reason is what visitors are told. Names one
                              agent, or with none, every hosted agent on the site
-  agents resume [page|support]
-                             Turn that agent's pause off, or with none, the site-wide one
+  agents resume [<id>]       Turn that agent's pause off, or with none, the site-wide one
   agents brand [--name <text>] [--logo <https url>] [--accent <#rrggbb>]
                [--privacy-url <https url>] [--clear name|logo|accent|privacy-url]...
                              The chat's look on the site: the name visitors see (at most 60

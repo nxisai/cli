@@ -9,6 +9,45 @@ published under the `beta` dist-tag; a plain version, under `latest`.
 
 ## [Unreleased]
 
+## [0.2.0-beta.1] - 2026-11-23
+
+### Added
+
+- **Every hosted agent by its catalog id.** `nxis agents enable <id>`, `configure <id>`,
+  `disable <id>`, `pause <id> [--tools] [--reason <text>]` and `resume <id>` work for any agent
+  NxisAI hosts (`page`, `support`, `quote`, `booking`, and agents added later), with flags read
+  from the agent's own setup in the catalog, so a newly hosted agent needs no CLI update. Quote and
+  Booking can now be turned on from the terminal: `nxis agents enable quote --label "Get a quote"
+  --connection Website`. A list setting repeats (`--example a --example b`) and replaces the list;
+  `configure --clear <setting>` returns one to its default. The NxisAI API now serves these
+  commands.
+- **`nxis agents catalog`** lists the agents NxisAI offers, with fit, readiness, whether NxisAI
+  hosts each, whether the site has added it, its state and what it still needs (`--job`,
+  `--industry`, `--readiness`, `--added`/`--not-added`, `--query`, `--by-fit`). `nxis agents
+  catalog <id>` shows one agent's settings as flags with their limits, its prerequisites with their
+  status, and the shortest `enable` line that works.
+- Flags are checked before anything is sent, as the service checks them, with reasons built from
+  the flag: `missing_<flag>`, `<flag>_too_long`, `too_many_<setting>` and `invalid_<flag>` (a
+  flag's `-` written `_`, as in `invalid_slot_minutes`), plus `unknown_flag` and `model_retired`.
+  The service's refusals map to `unknown_agent`, `agent_not_hosted`, `invalid_input` and
+  `version_conflict` (exit `1`), and `connection_required` (listing the site's connections by
+  name), `connection_not_found`, `connection_unusable`, `actions_off`, `records_missing` and
+  `opening_hours_required` (exit `2`). Turning on an agent whose serve-time needs are unmet exits
+  `0` with `state: "needs_setup"` and a `next` line.
+- `nxis agents status --json` adds `agents`, one entry per hosted agent with its state, settings
+  and pause.
+
+### Changed
+
+- Lengths are counted in UTF-16 code units, as the service counts them, so a label with emoji is
+  refused before sending rather than by the service.
+- `enable`, `disable`, `pause` and `resume` for `page` and `support` keep their flags, reasons and
+  output keys. Against an environment without hosted agents by id, they keep the older path; any
+  other id there fails with `hosted_agents_unavailable`. A flag that isn't one of an agent's
+  settings is now refused (`unknown_flag`) instead of ignored.
+- A list setting that takes each item once ignores case when it compares them, and a one-line
+  setting or list item refuses a line break (`invalid_<flag>`), as the service does.
+
 ## [0.2.0-beta.0] - 2026-11-22
 
 ### Fixed
