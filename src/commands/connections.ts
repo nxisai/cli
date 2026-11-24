@@ -8,7 +8,9 @@
  *
  * The signing secret is shown once, in the answer to `create` and to `rotate`, as
  * `signing_secret`. It is in no other output: not in `list`, not in an error, not in the
- * `--verbose` trace (which redacts `signing_secret`), and the CLI never keeps it.
+ * `--verbose` trace (which redacts `signing_secret`), and the CLI never keeps it. With
+ * `--write-env <file>` it isn't shown at all: it goes into that env file (which git must ignore),
+ * and the answer says where, as `written_to`, `env_name` and `secret_preview`.
  *
  * The work is done by the `*Op` functions, which return the `--json` payload. The commands emit it;
  * `nxis mcp serve` returns it as the tool result, so the two cannot drift apart.
@@ -21,13 +23,16 @@ import {
   listConnections,
   rotateConnectionSecret,
   setConnectionRoute,
+  testConnection,
   type Connection,
+  type ConnectionTest,
   type ConnectionList,
   type RouteInput,
   type SiteRef,
 } from "../api/connections.js";
 import { bool, str, type Flags } from "../args.js";
 import type { Ctx } from "../context.js";
+import { checkEnvTarget, writeEnvSecret, type EnvTarget } from "../env-file.js";
 import { CliError, failed, needsUser } from "../errors.js";
 import { bold, dim, plainText } from "../output.js";
 import { confirmOrStop, terminalAsker, type Asker } from "../prompt.js";
@@ -39,7 +44,7 @@ import { target } from "./hosted-agents.js";
 export const BIND_TARGETS = [...ACTION_NAMES, "booking", "default"] as const;
 export type BindTarget = (typeof BIND_TARGETS)[number];
 
-/** Targets that take Booking's options (`--supports-check`, `--availability-url`). */
+/** Targets that take Booking's free-times address (`--availability-url`). */
 const BOOKING_TARGETS: ReadonlySet<string> = new Set(["booking", "reserve", "schedule"]);
 
 /** What `--json` shows of a connection. Never the secret: only its first characters. */
@@ -56,6 +61,7 @@ export function connectionJson(c: Connection): Record<string, unknown> {
     secret_rotated_at: c.secretRotatedAt,
     is_default: c.isDefault,
     used_by: { agents: c.usedBy.agents, action_types: c.usedBy.actionTypes },
+    answers_checks: c.answersChecks,
   };
 }
 
@@ -183,6 +189,54 @@ const STORE_SECRET =
   "Store it where the receiving application reads its configuration (for example NXIS_ACTION_SECRET), " +
   "and check each request's signature with it. It is not shown again.";
 
+/** Where to write a new signing secret instead of showing it: an env file, and the variable. */
+export interface WriteEnv {
+  /** The env file, relative to the working directory. */
+  file: string;
+  /** The variable; `NXIS_ACTION_SECRET` when not given. */
+  name?: string;
+}
+
+/** @returns The env file checked, before the secret is issued; null when none was asked for. */
+function envTargetOf(writeEnv: WriteEnv | undefined): EnvTarget | null {
+  return writeEnv ? checkEnvTarget(writeEnv.file, writeEnv.name) : null;
+}
+
+/**
+ * Writes the new secret into the env file, and says where without showing it.
+ *
+ * @param done - What was done, for the message when the write fails: "Created the connection".
+ * @param retry - What to run then.
+ * @throws CliError `env_write_failed` (exit 1) when the file can't be written; it holds no secret.
+ */
+function secretToEnv(env: EnvTarget, secret: string, c: Connection, done: string, retry: string): Record<string, unknown> {
+  try {
+    writeEnvSecret(env, secret);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "error";
+    throw failed(
+      `${done} "${plainText(c.name)}", but couldn't write its signing secret to ${plainText(env.path)} (${code}), and it isn't shown. ` +
+        `Fix that, then run \`${retry}\` for a new one.`,
+      "env_write_failed",
+      { connection_id: c.id, connection: c.name, path: env.path, error_code: code },
+    );
+  }
+  return {
+    written_to: env.path,
+    env_name: env.name,
+    secret_preview: c.secretPreview,
+    git: env.git,
+    next:
+      `The signing secret is in ${env.path} as ${env.name}; it isn't shown, and the CLI doesn't keep it. ` +
+      "Have the receiving application read it from there and check each request's signature with it.",
+  };
+}
+
+/** @returns The `--write-env` command to issue a secret again, for a message. */
+function rotateWithEnv(c: Connection, env: EnvTarget): string {
+  return `nxis connections rotate "${plainText(c.name)}" --write-env ${plainText(env.path)} --env-name ${env.name} --yes`;
+}
+
 // ── operations ──────────────────────────────────────────────────────────────
 
 /** `nxis connections list`. */
@@ -196,32 +250,48 @@ export interface CreateArgs {
   name?: string;
   url?: string;
   makeDefault?: boolean;
+  /** Write the secret into this env file instead of returning it. */
+  writeEnv?: WriteEnv;
 }
 
-/** `nxis connections create`: the new connection, and its signing secret, once. */
+/**
+ * `nxis connections create`: the new connection, and its signing secret, once; or, with
+ * `writeEnv`, the secret written into that env file and not returned.
+ *
+ * @throws CliError the env file's refusals of {@link checkEnvTarget}, before anything is sent;
+ * `env_write_failed` after the connection is created.
+ */
 export async function createOp(t: SiteRef, args: CreateArgs): Promise<Record<string, unknown>> {
   const name = checkName(args.name);
   const url = checkUrl(args.url, "--url");
+  const env = envTargetOf(args.writeEnv);
   const created = await createConnection(t, { name, url, makeDefault: args.makeDefault === true });
-  return {
-    ok: true,
-    site: t.siteId,
-    connection: connectionJson(created.connection),
-    signing_secret: created.signingSecret,
-    next: STORE_SECRET,
-  };
+  const base = { ok: true, site: t.siteId, connection: connectionJson(created.connection) };
+  if (env) {
+    return { ...base, ...secretToEnv(env, created.signingSecret, created.connection, "Created the connection", rotateWithEnv(created.connection, env)) };
+  }
+  return { ...base, signing_secret: created.signingSecret, next: STORE_SECRET };
 }
 
-/** `nxis connections rotate`: a new signing secret, once, and who it affects. */
-export async function rotateOp(t: SiteRef, ref: string | undefined): Promise<Record<string, unknown>> {
+/**
+ * `nxis connections rotate`: a new signing secret, once, and who it affects; or, with
+ * `writeEnv`, the secret written into that env file and not returned.
+ *
+ * @throws CliError the env file's refusals of {@link checkEnvTarget}, before anything is sent;
+ * `env_write_failed` after the secret is rotated.
+ */
+export async function rotateOp(t: SiteRef, ref: string | undefined, writeEnv?: WriteEnv): Promise<Record<string, unknown>> {
+  const env = envTargetOf(writeEnv);
   const c = resolveConnection(await listConnections(t), ref, t.siteId);
   const rotated = await rotateConnectionSecret(t, c.id);
+  const base = { ok: true, site: t.siteId, connection: connectionJson(rotated.connection), affected: usageWords(rotated.connection) };
+  if (env) {
+    const written = secretToEnv(env, rotated.signingSecret, rotated.connection, "Rotated the signing secret of", rotateWithEnv(rotated.connection, env));
+    return { ...base, ...written, next: `The previous secret no longer works. ${String(written["next"])}` };
+  }
   return {
-    ok: true,
-    site: t.siteId,
-    connection: connectionJson(rotated.connection),
+    ...base,
     signing_secret: rotated.signingSecret,
-    affected: usageWords(rotated.connection),
     next:
       "The previous secret no longer works. " +
       STORE_SECRET.replace("Store it", "Give the new one to the receiving application now: store it"),
@@ -280,14 +350,17 @@ export function nameForAddress(url: string, list: ConnectionList): string {
   }
 }
 
-/** Checks Booking's options, which only a connection route for booking takes. */
+/**
+ * Checks the route's options. `--supports-check` goes with any route (the Quote agent checks the
+ * service area, Booking checks times); the free-times address only with a booking route.
+ */
 function checkBookingOptions(args: BindArgs): void {
-  if (args.supportsCheck === undefined && args.availabilityUrl === undefined) return;
+  if (args.availabilityUrl === undefined) return;
   if (!BOOKING_TARGETS.has(args.action)) {
     throw failed(
-      "--supports-check and --availability-url are Booking options: bind `booking` (or `schedule`, `reserve`) to use them.",
+      "--availability-url is a Booking option: bind `booking` (or `schedule`, `reserve`) to use it.",
       "invalid_input",
-      { field: args.supportsCheck !== undefined ? "supports_check" : "availability_url" },
+      { field: "availability_url" },
     );
   }
   if (args.availabilityUrl) checkUrl(args.availabilityUrl, "--availability-url");
@@ -368,6 +441,220 @@ export async function bindOp(t: SiteRef, args: BindArgs): Promise<Record<string,
   return payload;
 }
 
+/** What `--action` takes for a test: an action name, `booking`, `default`, or a schema.org action type. */
+export const TEST_ACTIONS = [...ACTION_NAMES, "booking", "default"] as const;
+
+/**
+ * The action type a test's example arguments are for, from `--action`.
+ *
+ * @returns `QuoteAction` for `quote`, `ScheduleAction` for `booking`, `default`, a schema.org
+ * action type as given (`QuoteAction`), or undefined when none was given: the service then uses
+ * the connection's own route.
+ * @throws CliError `invalid_input` (exit 1) for anything else.
+ */
+export function testActionType(action: string | undefined): string | undefined {
+  const a = (action ?? "").trim();
+  if (!a) return undefined;
+  if (a === "default") return "default";
+  if (a === "booking") return "ScheduleAction";
+  if ((ACTION_NAMES as readonly string[]).includes(a)) return `${a.charAt(0).toUpperCase()}${a.slice(1)}Action`;
+  if (/^[A-Z][A-Za-z]{1,40}Action$/.test(a)) return a;
+  throw failed(
+    `--action takes ${TEST_ACTIONS.join(", ")}, or an action type such as QuoteAction.`,
+    "invalid_input",
+    { field: "action" },
+  );
+}
+
+/** How a test's head line names who answered, when it wasn't the receiver. */
+const ANSWERED_BY_WORDS: Record<string, string> = { tunnel: "the tunnel", proxy: "a proxy", cdn: "the CDN" };
+
+/** @returns Whether a tunnel, proxy or CDN in front of the receiver answered, not the receiver. */
+function answeredInFront(r: ConnectionTest): boolean {
+  return r.answeredBy !== "" && r.answeredBy !== "receiver";
+}
+
+/** @returns Whether the answer came from an ngrok tunnel, by the service's words or the address. */
+function viaNgrok(r: ConnectionTest): boolean {
+  return /ngrok/i.test(r.detail) || /(^|\.)ngrok(-free)?\.(app|dev|io)$/i.test(hostOfUrl(r.url));
+}
+
+/** @returns The next step when a tunnel, proxy or CDN answered instead of the receiver. */
+function inFrontNextStep(r: ConnectionTest): string {
+  const said = r.detail ? `${plainText(r.detail)} ` : "";
+  const what = r.answeredBy === "tunnel" ? "tunnel" : "host";
+  const target =
+    r.answeredBy === "tunnel"
+      ? "the port the tunnel points at" +
+        (viaNgrok(r) ? " (for ngrok, http://127.0.0.1:4040/api/tunnels lists each tunnel's target)" : "")
+      : `the address and port the ${r.answeredBy === "cdn" ? "CDN" : "proxy"} forwards to (its origin or upstream)`;
+  return (
+    `${said}The ${what} at ${hostOfUrl(r.url)} is up, but it isn't reaching your server, so the receiver never got ` +
+    `the call. Check that the server is running and listening on ${target}, then test again.`
+  );
+}
+
+/** @returns The next step for a verdict, in words a person (or their agent) can act on. */
+export function testNextStep(r: ConnectionTest): string {
+  switch (r.verdict) {
+    case "ok":
+      return "The receiver accepted the signed check. Agents and actions routed to this connection can reach it.";
+    case "signature_rejected":
+      return (
+        `The receiver answered ${r.httpStatus}: it got the call and refused its signature. Either it reads a different ` +
+        "secret than this connection's (check the variable it reads, such as NXIS_ACTION_SECRET, and that it was " +
+        "restarted or redeployed since the secret was last set or rotated), or it verifies a parsed and re-serialized " +
+        "body instead of the raw request bytes: compute the HMAC over the exact body received, before parsing it."
+      );
+    case "unreachable":
+      if (answeredInFront(r)) return inFrontNextStep(r);
+      return (
+        `${r.detail ? `${plainText(r.detail)} ` : ""}Nothing answered at ${hostOfUrl(r.url)}: the receiver is not ` +
+        "deployed at that address, or the tunnel to a local receiver is down. Check it is running there, or point " +
+        "the connection at the address it runs at."
+      );
+    case "timeout":
+      return (
+        `${r.detail ? `${plainText(r.detail)} ` : ""}The receiver took too long to answer. A check should answer at ` +
+        "once, without committing anything: check that it isn't waiting on something before it replies, or starting cold."
+      );
+    case "bad_response":
+      return r.httpStatus >= 300 && r.httpStatus < 400
+        ? `The receiver answered ${r.httpStatus}, a redirect, which is not followed. Use the final address for the connection.`
+        : `The receiver answered ${r.httpStatus}: it got the call and didn't accept it. A check (X-Nxis-Mode: check, ` +
+            '"nxis:mode": "check" in the body) should answer 2xx, with a boolean "available" for a booking. ' +
+            (r.bodyExcerpt ? "Its answer began as shown." : "Its answer had no body.");
+    default:
+      return `The service answered "${plainText(r.verdict)}", which this CLI doesn't know yet. Update the CLI.`;
+  }
+}
+
+/**
+ * `nxis connections test`: one signed check call from NxisAI to the connection's address.
+ *
+ * @remarks
+ * Never throws for what the receiver did: the verdict is the answer, with `ok` false for every
+ * verdict but `ok`. The command turns a failing verdict into exit 2.
+ */
+export async function testOp(
+  t: SiteRef,
+  ref: string | undefined,
+  action?: string,
+  opts: { turnOnChecks?: boolean } = {},
+): Promise<Record<string, unknown>> {
+  const actionType = testActionType(action);
+  const c = resolveConnection(await listConnections(t), ref, t.siteId);
+  const r = await testConnection(t, c.id, actionType, opts.turnOnChecks ? { turnOnChecks: true } : {});
+  const checks = checksNextStep(r, c.name, opts.turnOnChecks === true);
+  return {
+    ok: r.verdict === "ok",
+    site: t.siteId,
+    connection: { id: c.id, name: c.name },
+    verdict: r.verdict,
+    http_status: r.httpStatus,
+    latency_ms: r.latencyMs,
+    url: r.url || c.url,
+    action_type: r.actionType || actionType || null,
+    tested_at: r.testedAt,
+    body_excerpt: r.bodyExcerpt,
+    ...(r.detail ? { detail: r.detail } : {}),
+    ...(r.answeredBy ? { answered_by: r.answeredBy } : {}),
+    answers_checks: r.answersChecks,
+    returned_windows: r.returnedWindows,
+    returned_hold: r.returnedHold,
+    check_support_off: r.checkSupportOff,
+    check_support_turned_on: r.checkSupportTurnedOn,
+    next: checks ? `${testNextStep(r)} ${checks}` : testNextStep(r),
+  };
+}
+
+/** A route on a connection, in plain words: "the site's default route", "quote requests" … */
+export function routeWords(route: string): string {
+  switch (route) {
+    case "default":
+      return "the site's default route";
+    case "QuoteAction":
+      return "quote requests";
+    case "AskAction":
+      return "questions";
+    case "ScheduleAction":
+      return "bookings";
+    case "ReserveAction":
+      return "reservations";
+    default: {
+      const name = plainText(route).replace(/Action$/, "");
+      return `${name ? name.toLowerCase() : plainText(route)} requests`;
+    }
+  }
+}
+
+/** @returns Several routes in words: "quote requests and bookings". */
+export function routesWords(routes: string[]): string {
+  const words = routes.map(routeWords);
+  if (words.length <= 1) return words[0] ?? "";
+  return `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
+/** @returns A route name as SetConnectionRoute takes it: `default` the site default, `QuoteAction` as QUOTE_ACTION. */
+export function routeInputOf(route: string): Pick<RouteInput, "actionType"> {
+  if (route === "default") return {};
+  return { actionType: route.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toUpperCase() };
+}
+
+/** @returns The command that tests a connection and turns check support on. */
+function turnOnCommand(name: string): string {
+  return `\`nxis connections test "${plainText(name)}" --turn-on-checks\``;
+}
+
+/**
+ * What a test found about availability checks, in words, for `next`; empty when there is nothing
+ * to say (no answer from the receiver, or a service that doesn't report it).
+ */
+export function checksNextStep(r: ConnectionTest, name: string, asked: boolean): string {
+  if (r.verdict !== "ok" || r.answersChecks === null) return "";
+  if (!r.answersChecks) {
+    return (
+      "It didn't answer as an availability check, though (a check's answer is JSON with \"available\": true or " +
+      "false), so agents that use this connection send requests without checking first: Booking takes visit " +
+      "requests for you to confirm, and Quote doesn't check the service area. To have them check first, make the " +
+      "receiver answer a check (X-Nxis-Mode: check, or \"nxis:mode\": \"check\" in the body) with " +
+      "{\"available\": true|false}, and for bookings the open \"windows\", as the receiver template does, then " +
+      `run ${turnOnCommand(name)}.`
+    );
+  }
+  const parts = [
+    "It answers availability checks" +
+      (r.returnedWindows ? `, with open times${r.returnedHold ? " and a hold" : ""}.` : "."),
+  ];
+  if (r.checkSupportTurnedOn.length > 0) {
+    parts.push(`Check support is now on for ${routesWords(r.checkSupportTurnedOn)}; the agents use it within seconds.`);
+  }
+  if (r.checkSupportOff.length > 0) {
+    parts.push(
+      `Check support is still off for ${routesWords(r.checkSupportOff)}, so agents there don't check first. ` +
+        (asked ? "Turn it on with `nxis actions bind <route> --connection <name> --supports-check`." : `Turn it on: ${turnOnCommand(name)}.`),
+    );
+  } else if (r.checkSupportTurnedOn.length === 0) {
+    parts.push("Agents and actions routed to this connection check with it before they send.");
+  }
+  return parts.join(" ");
+}
+
+/**
+ * Turns check support on for routes on a connection, one SetConnectionRoute each: no second call
+ * to the receiver, so the test's rate limit doesn't apply.
+ *
+ * @returns The routes turned on.
+ */
+export async function turnOnChecksOp(t: SiteRef, connectionId: string, routes: string[]): Promise<string[]> {
+  const done: string[] = [];
+  for (const route of routes) {
+    await setConnectionRoute(t, { ...routeInputOf(route), connectionId, supportsCheck: true });
+    done.push(route);
+  }
+  return done;
+}
+
 // ── commands ────────────────────────────────────────────────────────────────
 
 /** @returns One connection in a line or two, for a person. */
@@ -380,8 +667,17 @@ function describe(c: Record<string, unknown>): string {
   );
 }
 
-/** @returns The secret, said once, for a person. */
+/** @returns The secret, said once, for a person; or where it was written, without it. */
 function secretLines(payload: Record<string, unknown>): string[] {
+  if (payload["written_to"]) {
+    return [
+      "",
+      `Wrote the signing secret to ${bold(plainText(String(payload["written_to"])))} as ${String(payload["env_name"])} ` +
+        dim(`(it starts ${plainText(String(payload["secret_preview"]))}…; it isn't shown, and the CLI doesn't keep it).`),
+      "",
+      String(payload["next"]),
+    ];
+  }
   return [
     "",
     bold("Signing secret (shown once; it is not shown again and the CLI does not keep it):"),
@@ -408,6 +704,7 @@ export async function cmdConnectionsCreate(ctx: Ctx, args: CreateArgs): Promise<
   // Checked before signing in, so a typo fails at once.
   checkName(args.name);
   checkUrl(args.url, "--url");
+  envTargetOf(args.writeEnv);
   const payload = await createOp(await siteRefOf(ctx), args);
   ctx.io.emit(payload, () =>
     [`Created ${describe(payload["connection"] as Record<string, unknown>)}`, ...secretLines(payload)].join("\n"),
@@ -420,6 +717,8 @@ export interface ConfirmArgs {
   yes?: boolean;
   /** For tests. */
   asker?: Asker;
+  /** Rotate only: write the new secret into this env file instead of showing it. */
+  writeEnv?: WriteEnv;
 }
 
 /**
@@ -433,6 +732,8 @@ export interface ConfirmArgs {
  * @throws CliError `confirmation_required` or `cancelled` (exit 2), `connection_not_found` (exit 2).
  */
 export async function cmdConnectionsRotate(ctx: Ctx, ref: string | undefined, args: ConfirmArgs = {}): Promise<void> {
+  // Checked before asking, so a refused file costs nothing.
+  envTargetOf(args.writeEnv);
   const t = await siteRefOf(ctx);
   if (!args.yes && !isDryRun()) {
     const c = resolveConnection(await listConnections(t), ref, t.siteId);
@@ -448,7 +749,7 @@ export async function cmdConnectionsRotate(ctx: Ctx, ref: string | undefined, ar
       details: { site: t.siteId, connection: c.name, connection_id: c.id },
     });
   }
-  const payload = await rotateOp(t, ref);
+  const payload = await rotateOp(t, ref, args.writeEnv);
   ctx.io.emit(payload, () =>
     [
       `New signing secret for ${describe(payload["connection"] as Record<string, unknown>)}`,
@@ -481,6 +782,88 @@ export async function cmdConnectionsDelete(ctx: Ctx, ref: string | undefined, ar
   const payload = await deleteOp(t, ref);
   const deleted = payload["deleted"] as { name: string };
   ctx.io.emit(payload, () => `Deleted the connection "${plainText(deleted.name)}".`);
+}
+
+/** @returns A test's outcome in lines, for a person. */
+function testLines(payload: Record<string, unknown>): string {
+  const status = Number(payload["http_status"]);
+  const c = payload["connection"] as { name: string };
+  const by = typeof payload["answered_by"] === "string" ? payload["answered_by"] : "";
+  const head =
+    `${bold(String(payload["verdict"]))}  ${status > 0 ? `HTTP ${status}` : "no answer"}` +
+    `${by && by !== "receiver" ? ` from ${ANSWERED_BY_WORDS[by] ?? `the ${plainText(by)}`}` : ""}  ${String(payload["latency_ms"])} ms  ` +
+    `${plainText(String(payload["url"]))}`;
+  const lines = [head, dim(`Connection "${plainText(c.name)}", ${String(payload["action_type"] ?? "default")} example.`)];
+  const excerpt = String(payload["body_excerpt"] ?? "");
+  if (excerpt) lines.push(`${dim("Answer:")} ${plainText(excerpt)}`);
+  lines.push("", String(payload["next"]));
+  return lines.join("\n");
+}
+
+/**
+ * Runs `nxis connections test <name|id> [--action <type>] [--turn-on-checks]`.
+ *
+ * @remarks
+ * When the receiver answers availability checks and some routes on the connection have check
+ * support off, a person at a terminal is asked whether to turn it on; anywhere else `next` says
+ * so and gives the command. `--turn-on-checks` turns it on without asking.
+ *
+ * @throws CliError `connection_test_failed` (exit 2) for every verdict but `ok`, carrying the
+ * result; `rate_limited` (exit 1); `connection_not_found` (exit 2).
+ */
+export async function cmdConnectionsTest(
+  ctx: Ctx,
+  ref: string | undefined,
+  action?: string,
+  opts: { turnOnChecks?: boolean; asker?: Asker } = {},
+): Promise<void> {
+  // Checked before signing in, so a typo fails at once.
+  testActionType(action);
+  const t = await siteRefOf(ctx);
+  let payload = await testOp(t, ref, action, opts.turnOnChecks ? { turnOnChecks: true } : {});
+  const off = (payload["check_support_off"] as string[] | undefined) ?? [];
+  const asker = opts.asker ?? terminalAsker;
+  if (payload["ok"] === true && payload["answers_checks"] === true && off.length > 0 && !opts.turnOnChecks && !ctx.io.json && !isDryRun() && asker.interactive) {
+    const c = payload["connection"] as { id: string; name: string };
+    process.stderr.write(`${testLines(payload)}\n\n`);
+    const yes = await asker.confirm(
+      `Your receiver answers availability checks, but check support is off for ${routesWords(off)}. Turn it on?`,
+    );
+    if (yes) {
+      const turned = await turnOnChecksOp(t, c.id, off);
+      const r: ConnectionTest = {
+        verdict: "ok",
+        httpStatus: Number(payload["http_status"]),
+        latencyMs: Number(payload["latency_ms"]),
+        bodyExcerpt: String(payload["body_excerpt"] ?? ""),
+        url: String(payload["url"]),
+        testedAt: (payload["tested_at"] as string | null) ?? null,
+        actionType: String(payload["action_type"] ?? ""),
+        detail: "",
+        answeredBy: String(payload["answered_by"] ?? ""),
+        answersChecks: true,
+        returnedWindows: payload["returned_windows"] === true,
+        returnedHold: payload["returned_hold"] === true,
+        checkSupportOff: off.filter((x) => !turned.includes(x)),
+        checkSupportTurnedOn: turned,
+      };
+      payload = {
+        ...payload,
+        check_support_off: r.checkSupportOff,
+        check_support_turned_on: turned,
+        next: `${testNextStep(r)} ${checksNextStep(r, c.name, true)}`,
+      };
+    }
+    // The test's lines are shown above the question; after it, only what changed.
+    const after = payload;
+    ctx.io.emit(after, () => String(after["next"]));
+    return;
+  }
+  if (payload["ok"] !== true) {
+    const { ok: _ok, ...details } = payload;
+    throw needsUser(testLines(payload), "connection_test_failed", details);
+  }
+  ctx.io.emit(payload, () => testLines(payload));
 }
 
 /** @returns The bind payload in words, for a person. */
@@ -525,10 +908,43 @@ export function supportsCheckFlag(flags: Flags): boolean | undefined {
   throw failed("--supports-check takes no value, or =true or =false.", "invalid_input", { field: "supports_check" });
 }
 
+/**
+ * Reads `--write-env <file>` and `--env-name <name>`.
+ *
+ * @throws CliError `missing_value` (exit 1) for either given without a value; `invalid_input` for
+ * `--env-name` without `--write-env`.
+ */
+export function writeEnvFlags(flags: Flags): WriteEnv | undefined {
+  const name = flags.has("env-name") ? str(flags, "env-name")?.trim() : undefined;
+  if (flags.has("env-name") && !name) {
+    throw failed("--env-name needs the variable to write the secret to, such as --env-name NXIS_ACTION_SECRET.", "missing_value", {
+      flag: "--env-name",
+    });
+  }
+  if (!flags.has("write-env")) {
+    if (name !== undefined) throw failed("--env-name goes with --write-env <file>.", "invalid_input", { field: "env_name" });
+    return undefined;
+  }
+  const file = str(flags, "write-env")?.trim();
+  if (!file) {
+    throw failed("--write-env needs the env file to write the secret to, such as --write-env .env.local.", "missing_value", {
+      flag: "--write-env",
+    });
+  }
+  return { file, ...(name !== undefined ? { name } : {}) };
+}
+
+/** @returns `{ writeEnv }` when `--write-env` was given, else nothing. */
+function writeEnvArg(flags: Flags): { writeEnv?: WriteEnv } {
+  const writeEnv = writeEnvFlags(flags);
+  return writeEnv ? { writeEnv } : {};
+}
+
 /** How to call `nxis connections`. */
 const CONNECTIONS_USAGE =
-  "Try `nxis connections list`, `nxis connections create --name <name> --url <url> [--default]`, " +
-  "`nxis connections rotate <name|id>` or `nxis connections delete <name|id>`.";
+  "Try `nxis connections list`, `nxis connections create --name <name> --url <url> [--default] [--write-env <file>]`, " +
+  "`nxis connections rotate <name|id> [--write-env <file>]`, `nxis connections test <name|id> [--action <type>] [--turn-on-checks]` " +
+  "or `nxis connections delete <name|id>`.";
 
 /** Routes `nxis connections <sub>`. */
 export async function runConnections(ctx: Ctx, positional: string[], flags: Flags): Promise<void> {
@@ -542,11 +958,14 @@ export async function runConnections(ctx: Ctx, positional: string[], flags: Flag
         ...(str(flags, "name") !== undefined ? { name: str(flags, "name") as string } : {}),
         ...(str(flags, "url") !== undefined ? { url: str(flags, "url") as string } : {}),
         makeDefault: bool(flags, "default"),
+        ...writeEnvArg(flags),
       });
     case "rotate":
-      return cmdConnectionsRotate(ctx, ref, { yes: bool(flags, "yes") });
+      return cmdConnectionsRotate(ctx, ref, { yes: bool(flags, "yes"), ...writeEnvArg(flags) });
     case "delete":
       return cmdConnectionsDelete(ctx, ref, { yes: bool(flags, "yes") });
+    case "test":
+      return cmdConnectionsTest(ctx, ref, str(flags, "action"), { turnOnChecks: bool(flags, "turn-on-checks") });
     default:
       throw new CliError(CONNECTIONS_USAGE, { reason: "unknown_command" });
   }

@@ -244,6 +244,13 @@ describe("nxis agents dpa", () => {
   it("refuses another subcommand", async () => {
     await fails(["dpa", "reject"], "unknown_command");
   });
+
+  it("lists the agents subcommands once each, joined by semicolons, for an unknown one", async () => {
+    const err = await fails(["frobnicate"], "unknown_command");
+    expect(err.message).toMatch(/^Try one of: `nxis agents status`; /);
+    expect(err.message).toContain("; `nxis agents transcripts list|show|export|delete|settings|webhook`; `nxis agents dpa`");
+    expect(err.message).not.toMatch(/` or `nxis agents dpa` or /);
+  });
 });
 
 describe("nxis agents dpa accept", () => {

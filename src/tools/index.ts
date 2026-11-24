@@ -59,11 +59,17 @@ import {
 } from "./provisioning.js";
 import { listTypes, query } from "./reads.js";
 import { CONNECTION_TOOLS } from "./connections.js";
+import { SETUP_TOOLS } from "./setup.js";
+import { AGENT_TOOLS } from "./agents.js";
+import { ORG_TOOLS } from "./orgs.js";
 
 export * from "./define.js";
 export * from "./provisioning.js";
 export * from "./reads.js";
 export * from "./connections.js";
+export * from "./setup.js";
+export * from "./agents.js";
+export * from "./orgs.js";
 export {
   findSite,
   hostOf,
@@ -72,18 +78,22 @@ export {
   resolveSiteId,
   SITE_MCP_URL_ENV,
   siteMcpUrl,
+  stackMcpUrl,
   type SiteMatch,
 } from "./sites.js";
 
 /**
- * Every tool, in the order the onboarding runs them: sites, data, MCP and discovery, then reads.
- * The connection tools sit beside `nxis_bind_mcp_action`; they are the CLI's own (surface `local`).
+ * Every tool, in the order the onboarding runs them: the organization, the plan, sites, data, MCP and discovery, then reads.
+ * The connection tools sit beside `nxis_bind_mcp_action`, and the hosted agent tools come once the site
+ * is set up; both are the CLI's own (surface `local`).
  *
  * @remarks
  * Typed loosely so tools with different schemas share one list; a command that wants typed input
  * and output imports the tool itself.
  */
 export const TOOLS: readonly ToolDef[] = [
+  ...ORG_TOOLS,
+  ...SETUP_TOOLS,
   listSites,
   createSite,
   verifySite,
@@ -99,6 +109,7 @@ export const TOOLS: readonly ToolDef[] = [
   onPageAgent,
   aioFiles,
   listInApp,
+  ...AGENT_TOOLS,
   listTypes,
   query,
 ];

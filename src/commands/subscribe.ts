@@ -17,26 +17,47 @@ import { openUrl } from "../browser.js";
 import { listTiers, createSubscription, getSubscription, paymentLinkUrl, LIVE_STATUSES, type Tier } from "../api/billing.js";
 import type { Ctx } from "../context.js";
 import { requireOrg, requireSession } from "../context.js";
-import { failed, needsUser } from "../errors.js";
+import { CliError, failed, needsUser } from "../errors.js";
+import { guideOf, refused, type Guide } from "../guide.js";
 import { pollUntil } from "../http.js";
-import { bold, formatCredits, formatInterval, formatPrice } from "../output.js";
+import { bold, formatCredits, formatInterval, formatPrice, plainText } from "../output.js";
 
 /** Arguments for `nxis subscribe`. */
 export interface SubscribeArgs {
-  tier: string;
+  /** The plan. Without one, a person is offered the plans to choose from. */
+  tier?: string;
   noOpen?: boolean;
   timeoutMinutes?: number;
   dev?: boolean;
 }
 
+/** What subscribing did: the `--json` result and its line for a person. */
+export interface Subscribed {
+  payload: Record<string, unknown>;
+  human: string;
+}
+
 /**
- * Runs `nxis subscribe <tier>`.
+ * Runs `nxis subscribe [<tier>]`.
  *
- * @throws CliError `unknown_tier`, `tier_inactive` or `tier_not_purchasable` (exit 1);
- * `payment_pending` (exit 2).
+ * @throws CliError `missing_tier` (exit 1) with no tier and nobody to choose one; `unknown_tier`,
+ * `tier_inactive` or `tier_not_purchasable` (exit 1); `payment_pending` (exit 2); `cancelled`
+ * (exit 2) when the person chose no plan.
  */
 export async function cmdSubscribe(ctx: Ctx, args: SubscribeArgs): Promise<void> {
   const { config, io } = ctx;
+  if (!args.tier) {
+    const guide = guideOf(ctx);
+    if (!guide.interactive) throw new CliError("Which plan? Try `nxis plans` first.", { reason: "missing_tier" });
+    const { token } = await requireSession(ctx);
+    const orgId = requireOrg(ctx);
+    const { guidedPlan } = await import("../guided/plan.js");
+    const out = await guidedPlan(ctx, guide, { token, orgId, ...args });
+    if (!out.ok) throw refused(guide, out.why, "No plan was chosen; nothing changed.", { org_id: orgId });
+    io.emit(out.value.payload, () => out.value.human);
+    return;
+  }
+
   const { token } = await requireSession(ctx);
   const orgId = requireOrg(ctx);
 
@@ -58,11 +79,26 @@ export async function cmdSubscribe(ctx: Ctx, args: SubscribeArgs): Promise<void>
     throw failed(`The ${tier.tier} plan is not open for new subscriptions.`, "tier_inactive");
   }
 
-  if (!tier.paid) {
-    await activateFree(ctx, orgId, tier, token);
-    return;
-  }
-  await payForTier(ctx, orgId, tier, token, args);
+  const out = await subscribeTo(ctx, orgId, tier, token, args);
+  io.emit(out.payload, () => out.human);
+}
+
+/**
+ * Puts the organization on a plan: a free one at once, a paid one through its payment page.
+ *
+ * @param guide - Sends the person to the payment page and waits, through the agent. Without one,
+ * the page is announced on stderr and opened in a browser.
+ * @throws CliError `tier_not_purchasable` (exit 1); `payment_pending` (exit 2) when the wait ran
+ * out; and, through an agent, the guide's stop when the person declined the page.
+ */
+export async function subscribeTo(
+  ctx: Ctx,
+  orgId: string,
+  tier: Tier,
+  token: string,
+  args: Omit<SubscribeArgs, "tier"> & { guide?: Guide },
+): Promise<Subscribed> {
+  return tier.paid ? payForTier(ctx, orgId, tier, token, args) : activateFree(ctx, orgId, tier, token);
 }
 
 /**
@@ -72,21 +108,18 @@ export async function cmdSubscribe(ctx: Ctx, args: SubscribeArgs): Promise<void>
  * Idempotent on the service: an existing subscription comes back untouched, and a previously
  * cancelled free one is reactivated in place with its quotas intact.
  */
-async function activateFree(ctx: Ctx, orgId: string, tier: Tier, token: string): Promise<void> {
-  const { config, io } = ctx;
-  const sub = await createSubscription(config, token, orgId, tier.tier);
-
-  io.emit(
-    {
+async function activateFree(ctx: Ctx, orgId: string, tier: Tier, token: string): Promise<Subscribed> {
+  const sub = await createSubscription(ctx.config, token, orgId, tier.tier);
+  return {
+    payload: {
       ok: true,
       status: sub?.status ?? "ACTIVE",
       tier: tier.tier,
       org_id: orgId,
       credits_milli: tier.creditsMilli,
     },
-    () =>
-      `${bold(tier.name ?? tier.tier)} is active — ${formatCredits(tier.creditsMilli)} lifetime credits.`,
-  );
+    human: `${bold(tier.name ?? tier.tier)} is active — ${formatCredits(tier.creditsMilli)} lifetime credits.`,
+  };
 }
 
 /**
@@ -102,8 +135,8 @@ async function payForTier(
   orgId: string,
   tier: Tier,
   token: string,
-  args: SubscribeArgs,
-): Promise<void> {
+  args: Omit<SubscribeArgs, "tier"> & { guide?: Guide },
+): Promise<Subscribed> {
   const { config, io } = ctx;
 
   if (!tier.stripeLinkId) {
@@ -116,29 +149,47 @@ async function payForTier(
 
   const url = paymentLinkUrl(tier.stripeLinkId, orgId);
   const price = `${formatPrice(tier.price)}${formatInterval(tier.interval, tier.intervalCount)}`;
-
-  io.note("");
-  io.note(`  ${bold(tier.name ?? tier.tier)} — ${bold(price)}, ${formatCredits(tier.creditsMilli)} per period`);
-  io.note(`  Pay at: ${url}`);
-  io.note("");
-  io.note("Card details go to Stripe only. Waiting for the payment to clear…");
-
-  if (!args.noOpen) openUrl(url);
-
   const timeoutMs = (args.timeoutMinutes ?? 15) * 60_000;
-  const found = await pollUntil({
-    timeoutMs,
-    attempt: async () => {
-      const sub = await getSubscription(config, token, orgId).catch(() => null);
-      return sub && LIVE_STATUSES.has(sub.status) ? sub : null;
-    },
-    onTick: (elapsed) => {
-      const mins = Math.floor(elapsed / 60_000);
-      if (mins > 0 && elapsed % 60_000 < 10_000) {
-        io.note(`Still waiting for Stripe (${mins}m). Leave this running, or check later with \`nxis status\`.`);
-      }
-    },
-  });
+  const wait = (signal?: AbortSignal) =>
+    pollUntil({
+      timeoutMs,
+      ...(signal ? { signal } : {}),
+      attempt: async () => {
+        const sub = await getSubscription(config, token, orgId).catch(() => null);
+        return sub && LIVE_STATUSES.has(sub.status) ? sub : null;
+      },
+      onTick: (elapsed) => {
+        const mins = Math.floor(elapsed / 60_000);
+        if (mins > 0 && elapsed % 60_000 < 10_000) {
+          io.note(`Still waiting for Stripe (${mins}m). Leave this running, or check later with \`nxis status\`.`);
+        }
+      },
+    });
+
+  let found;
+  if (args.guide?.kind === "agent") {
+    const answer = await args.guide.visit({
+      message:
+        `Pay for the ${plainText(tier.name ?? tier.tier)} plan: ${price}, ${formatCredits(tier.creditsMilli)} per period. ` +
+        "Open the payment page and pay there; nothing you enter on it reaches the agent. This waits until the " +
+        "payment clears.",
+      url,
+      until: wait,
+    });
+    if (!answer.ok) {
+      throw refused(args.guide, answer.why, "The payment page was declined, so nothing was charged.", { tier: tier.tier });
+    }
+    found = answer.value;
+  } else {
+    io.note("");
+    io.note(`  ${bold(tier.name ?? tier.tier)} — ${bold(price)}, ${formatCredits(tier.creditsMilli)} per period`);
+    io.note(`  Pay at: ${url}`);
+    io.note("");
+    io.note("Card details go to Stripe only. Waiting for the payment to clear…");
+
+    if (!args.noOpen) openUrl(url);
+    found = await wait();
+  }
 
   if (!found) {
     throw needsUser(
@@ -149,14 +200,14 @@ async function payForTier(
     );
   }
 
-  io.emit(
-    {
+  return {
+    payload: {
       ok: true,
       status: found.status,
       tier: tier.tier,
       org_id: orgId,
       credits_milli: tier.creditsMilli,
     },
-    () => `Paid — ${bold(tier.name ?? tier.tier)} is active (${formatCredits(tier.creditsMilli)} per period).`,
-  );
+    human: `Paid — ${bold(tier.name ?? tier.tier)} is active (${formatCredits(tier.creditsMilli)} per period).`,
+  };
 }

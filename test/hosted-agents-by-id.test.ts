@@ -384,6 +384,50 @@ describe("nxis agents enable <id>", () => {
     expect(e.toJSON()).toMatchObject(details);
   });
 
+  it("a refused enable that kept the route keeps the settings too, and says so in sentences", async () => {
+    agents["quote"] = { enabled: false, settings: {} };
+    const note = "Quote needs prices on your site, which the Quote agent quotes from The agent's route to the connection was set, and stays.";
+    refusals = [err(9, 400, "RECORDS_MISSING", { agent: "quote", types: "Offer" }, note)];
+    const e = await fails(["enable", "quote", "--label", "Copperline Quote", "--connection", "Website"], "records_missing");
+    expect(e.exitCode).toBe(2);
+    expect(e.message).toBe(
+      "Quote needs prices on your site, which the Quote agent quotes from. The agent's route to the connection and the settings given were saved, and stay; the agent is still off.",
+    );
+    expect(e.toJSON()).toMatchObject({ kept: ["route", "settings"], types: ["Offer"] });
+    const w = writes();
+    expect(w).toHaveLength(2);
+    expect(w[1]?.method).toBe("PATCH");
+    expect(w[1]?.body).toMatchObject({ settings: { label: "Copperline Quote" } });
+    expect(new URLSearchParams((w[1]?.url ?? "").split("?")[1]).get("expected_version")).toBe("42");
+    expect(agents["quote"]).toMatchObject({ enabled: false, settings: { label: "Copperline Quote" } });
+  });
+
+  it("says when the settings couldn't be saved with the route", async () => {
+    agents["quote"] = { enabled: false, settings: {} };
+    const note = "Quote needs prices on your site. The agent's route to the connection was set, and stays.";
+    refusals = [err(9, 400, "RECORDS_MISSING", { agent: "quote" }, note), err(10, 409, "AGENT_CONFIG_CHANGED", {})];
+    const e = await fails(["enable", "quote", "--label", "Q", "--connection", "Website"], "records_missing");
+    expect(e.message).toBe(
+      "Quote needs prices on your site. The agent's route to the connection was set, and stays, but the settings given weren't saved (version_conflict); the agent is still off.",
+    );
+    expect(e.toJSON()).toMatchObject({ kept: ["route"], settings_error: "version_conflict" });
+  });
+
+  it("a refusal before the route is set keeps nothing and saves nothing more", async () => {
+    agents["quote"] = { enabled: false, settings: {} };
+    refusals = [err(9, 400, "RECORDS_MISSING", { agent: "quote" }, "Quote needs prices on your site.")];
+    const e = await fails(["enable", "quote", "--label", "Q"], "records_missing");
+    expect(e.message).toBe("Quote needs prices on your site.");
+    expect(e.toJSON()["kept"]).toBeUndefined();
+    expect(writes()).toHaveLength(1);
+  });
+
+  it("joins connection_required's hint as a sentence", async () => {
+    refusals = [err(9, 400, "CONNECTION_REQUIRED", { agent: "quote" }, "Quote needs a connection to send its requests through")];
+    const e = await fails(["enable", "quote", "--label", "Q"], "connection_required");
+    expect(e.message).toBe('Quote needs a connection to send its requests through. Run it again with --connection <name>: "Website".');
+  });
+
   it("checks Booking's integer range before sending: invalid_slot_minutes with min and max", async () => {
     const e = await fails(["enable", "booking", "--label", "Book", "--slot-minutes", "10"], "invalid_slot_minutes");
     expect(e.exitCode).toBe(1);
@@ -513,6 +557,16 @@ describe("nxis agents configure|disable|pause|resume <id>", () => {
     expect(out.json).toMatchObject({ changed: true, agent: { settings: { label: "Q", examples: ["a", "b"] } } });
   });
 
+  it("--clear takes the setting's name as well as its flag", async () => {
+    for (const name of ["example", "examples"]) {
+      agents["quote"] = { enabled: true, settings: { label: "Q", examples: ["a"] } };
+      const before = writes().length;
+      await run(["configure", "quote", "--clear", name]);
+      expect(writes()[before]?.body).toMatchObject({ settings: { examples: null } });
+    }
+    await fails(["configure", "quote", "--example", "b", "--clear", "examples"], "conflicting_flags");
+  });
+
   it("refuses clearing a required setting of an agent that is on, a flag set and cleared, and nothing at all", async () => {
     agents["quote"] = { enabled: true, settings: { label: "Q" } };
     await fails(["configure", "quote", "--clear", "label"], "missing_label");
@@ -604,5 +658,13 @@ describe("nxis agents status", () => {
     expect(list.map((a) => a["id"])).toEqual(["page", "support", "quote", "booking", "events"]);
     expect(list[2]).toMatchObject({ id: "quote", enabled: true, state: "paused", state_reason: "site_paused", settings: { label: "Q" } });
     expect(out.text).toContain("By catalog id");
+  });
+});
+
+describe("sentences", () => {
+  it("ends each part as a sentence and leaves out empty ones", async () => {
+    const { sentences } = await import("../src/api/hosted-agents.js");
+    expect(sentences("One", " Two. ", "", undefined, "Three?", 'Four ("x").')).toBe('One. Two. Three? Four ("x").');
+    expect(sentences()).toBe("");
   });
 });

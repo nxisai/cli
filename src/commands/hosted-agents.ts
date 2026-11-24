@@ -58,6 +58,7 @@ import { findSite } from "../tools/index.js";
 import { getAgentSetup, dpaBaseUrl, dpaUrl, type AgentSetup } from "../api/agent-setup.js";
 import { cmdAgentsDpa, cmdAgentsDpaAccept, dpaState } from "./agents-dpa.js";
 import { terminalAsker, type Asker } from "../prompt.js";
+import { isDryRun } from "../trace.js";
 import { runTranscripts } from "./transcripts.js";
 import { listHostedAgents, type HostedAgentList } from "../api/hosted-agents.js";
 import {
@@ -144,6 +145,9 @@ export async function runHostedAgents(ctx: Ctx, args: string[], flags: Flags, as
         });
         return;
       }
+      // On a terminal, the agreement the agents wait on is offered first.
+      const { agreementBeforeEnable } = await import("../guided/agreement.js");
+      await agreementBeforeEnable(ctx, { yes: bool(flags, "yes"), dryRun: isDryRun() });
       await cmdAgentEnable(ctx, id, flags, {
         ...fallback,
         ...(isLegacy(id) ? { legacy: () => cmdAgentsEnable(ctx, id, legacySettings(flags)) } : {}),
@@ -211,9 +215,9 @@ export async function runHostedAgents(ctx: Ctx, args: string[], flags: Flags, as
     }
     default:
       throw new CliError(
-        `Try ${USAGE.status}, ${USAGE.catalog}, ${USAGE.enable}, ${USAGE.configure}, ${USAGE.disable}, ${USAGE.pause}, ` +
-          `${USAGE.resume}, ${USAGE.brand}, ${USAGE.policy}, ` +
-          `${USAGE.transcripts} or ${USAGE.dpa}.`,
+        // Semicolons, since some usages already carry their own "or".
+        `Try one of: ${USAGE.status}; ${USAGE.catalog}; ${USAGE.enable}; ${USAGE.configure}; ${USAGE.disable}; ` +
+          `${USAGE.pause}; ${USAGE.resume}; ${USAGE.brand}; ${USAGE.policy}; ${USAGE.transcripts}; ${USAGE.dpa}.`,
         { reason: "unknown_command" },
       );
   }
@@ -498,7 +502,8 @@ export async function cmdAgentsConfigure(ctx: Ctx, agent: HostedAgent, args: Ena
     });
   }
   for (const example of examples ?? []) checkLength("--example", example, LIMITS.example, "example_too_long");
-  const cleared = new Set(clear);
+  // The flag (`example`) or the setting's name (`examples`).
+  const cleared = new Set(clear.map((c) => (c === "examples" ? "example" : c)));
   await write(ctx, (s) => {
     const current = s[agent] ?? {};
     const next: Record<string, unknown> = { ...current };
@@ -578,7 +583,7 @@ export async function cmdAgentsResume(ctx: Ctx, agent?: HostedAgent): Promise<vo
 /** A part of the chat's branding `nxis agents brand` sets or clears, by its flag. */
 export type BrandField = "name" | "logo" | "accent" | "privacy-url";
 
-const BRAND_FIELDS: readonly BrandField[] = ["name", "logo", "accent", "privacy-url"];
+export const BRAND_FIELDS: readonly BrandField[] = ["name", "logo", "accent", "privacy-url"];
 
 /** Where each part is kept: in `page.branding`, or (the privacy link) in `page`. */
 const BRAND_KEYS: Record<BrandField, string> = { name: "name", logo: "logoUrl", accent: "accentColor", "privacy-url": "privacyUrl" };
@@ -680,6 +685,16 @@ function checkPageUrl(flag: string, raw: string): string {
  * before anything is sent), and whatever {@link write} throws.
  */
 export async function cmdAgentsBrand(ctx: Ctx, args: BrandArgs): Promise<void> {
+  await write(ctx, brandChange(args));
+}
+
+/**
+ * Checks `nxis agents brand`'s options, before anything is read or sent.
+ *
+ * @returns The change to the config they make.
+ * @throws CliError the reasons of {@link cmdAgentsBrand}.
+ */
+export function brandChange(args: BrandArgs): (settable: SettableConfig) => SettableConfig {
   const clear = new Set(args.clear ?? []);
   const given: Record<BrandField, string | undefined> = {
     name: args.name,
@@ -720,11 +735,11 @@ export async function cmdAgentsBrand(ctx: Ctx, args: BrandArgs): Promise<void> {
     return value !== undefined ? { [BRAND_KEYS[field]]: value } : {};
   };
 
-  await write(ctx, (s) => {
+  return (s) => {
     const page = s.page ?? {};
     const branding = { ...object(page["branding"]), ...part("name"), ...part("logo"), ...part("accent") };
     return { ...s, page: { ...page, branding, ...part("privacy-url") } };
-  });
+  };
 }
 
 /** @returns The value when it is a plain object, else undefined. */

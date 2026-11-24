@@ -32,6 +32,7 @@ import {
   looksLikeSiteId,
   query,
   setSiteName,
+  stackMcpUrl,
   verifySite,
   type ToolCaller,
 } from "../src/tools/index.js";
@@ -48,7 +49,10 @@ interface Seen {
   key: string | undefined;
 }
 
-const fake = { calls: [] as Seen[], publicSite: true };
+const fake = { calls: [] as Seen[], publicSite: true, productionHost: false };
+
+/** The host a site's server has in production, which a local stack serves under `/tenant/`. */
+const SITE_HOST = "example-com-site-1.mcp.nxis.ai";
 let base: string;
 
 /** The sites `nxis_list_sites` reports. */
@@ -64,7 +68,7 @@ function sites() {
         host: "example.com",
         is_verified: true,
         active: true,
-        mcp: { endpoint: `${base}/site-public/mcp`, enabled: true, is_public: fake.publicSite, listed_in_app: false },
+        mcp: { endpoint: fake.productionHost ? `https://${SITE_HOST}/mcp` : `${base}/site-public/mcp`, enabled: true, is_public: fake.publicSite, listed_in_app: false },
       },
       { site: "site-2", domain: "other.example", host: "other.example", is_verified: false, active: true },
     ],
@@ -97,7 +101,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const endpoint: Seen["endpoint"] | null =
     url === `/v1/organizations/${ORG}/mcp`
       ? "provisioning"
-      : url === "/site-public/mcp"
+      : url === "/site-public/mcp" || url === `/tenant/${SITE_HOST}/mcp`
         ? "site-public"
         : url === "/site-private/mcp"
           ? "site-private"
@@ -148,6 +152,7 @@ beforeEach(() => {
   delete process.env.NXIS_SITE_MCP_URL;
   fake.calls = [];
   fake.publicSite = true;
+  fake.productionHost = false;
   saveProvisioningKey({
     apiKey: KEY,
     keyId: "key-1",
@@ -254,6 +259,15 @@ describe("site tools", () => {
     expect(out.data).toEqual({ tool: "nxis_list_types", args: { limit: 5 } });
   });
 
+  it("read a site reported on its production host from the stack the CLI points at", async () => {
+    fake.productionHost = true;
+    await listTypes.run(ctx({ siteOverride: "example.com" }), { limit: 5 });
+    expect(fake.calls.map((c) => [c.endpoint, c.tool])).toEqual([
+      ["provisioning", "nxis_list_sites"],
+      ["site-public", "nxis_list_types"],
+    ]);
+  });
+
   it("use NXIS_SITE_MCP_URL when set, without asking the provisioning endpoint", async () => {
     process.env.NXIS_SITE_MCP_URL = `${base}/site-private/mcp`;
     await query.run(ctx(), { filter: { schema_type: "Product" } });
@@ -286,6 +300,20 @@ describe("site tools", () => {
     );
     expect(err.reason).toBe("invalid_input");
     expect(err.details["field"]).toBe("site");
+  });
+});
+
+describe("stackMcpUrl", () => {
+  it("keeps the endpoint against production, and one already on the stack", () => {
+    expect(stackMcpUrl("https://mcp.nxis.ai", `https://${SITE_HOST}/mcp`)).toBe(`https://${SITE_HOST}/mcp`);
+    expect(stackMcpUrl("https://mcp.nxis.ai/", `https://${SITE_HOST}/mcp`)).toBe(`https://${SITE_HOST}/mcp`);
+    expect(stackMcpUrl("https://stack.example", "https://stack.example/tenant/x/mcp")).toBe("https://stack.example/tenant/x/mcp");
+  });
+
+  it("serves a production host from another stack's /tenant/ route", () => {
+    expect(stackMcpUrl("https://stack.example/", `https://${SITE_HOST}/mcp`)).toBe(`https://stack.example/tenant/${SITE_HOST}/mcp`);
+    expect(stackMcpUrl("http://localhost:8080", `https://${SITE_HOST}/mcp`)).toBe(`http://localhost:8080/tenant/${SITE_HOST}/mcp`);
+    expect(stackMcpUrl("https://stack.example", "not a url")).toBe("not a url");
   });
 });
 

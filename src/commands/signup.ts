@@ -20,6 +20,8 @@ import { formatCredits, formatInterval, formatPrice } from "../output.js";
 import { accountIdFromClaims, decodeJwt } from "../tokens.js";
 import { updateSettings } from "../state.js";
 import { cmdOrgsCreate } from "./orgs.js";
+import { guideOf } from "../guide.js";
+import { guidedPlan } from "../guided/plan.js";
 
 /** Arguments for `nxis signup`. */
 export interface SignupArgs {
@@ -33,7 +35,9 @@ export interface SignupArgs {
  *
  * @remarks
  * An existing organization is reused rather than creating another. An organization already on
- * a plan only needs `mcp install`. Otherwise it stops with `choose_plan` and three options:
+ * a plan only needs `mcp install`. Otherwise, on a terminal, it offers the plans to choose from
+ * (price, interval and credit grant) and subscribes to the one chosen; anywhere else, or when
+ * none is chosen, it stops with `choose_plan` and three options:
  * the free plan, the free plan plus a credit top-up (two commands, because a top-up needs an
  * active plan), and the cheapest paid plan.
  *
@@ -114,20 +118,28 @@ export async function cmdSignup(ctx: Ctx, args: SignupArgs): Promise<void> {
     },
   ].filter(Boolean) as Array<{ choice: number; label: string; run: string }>;
 
-  throw needsUser(
-    "Pick a plan to continue.",
-    "choose_plan",
-    {
-      org_id: orgId,
-      dev_mode: dev,
-      options,
-      plans: tiers.map((t) => ({
-        tier: t.tier,
-        name: t.name,
-        price: t.price,
-        credits_milli: t.creditsMilli,
-        paid: t.paid,
-      })),
-    },
-  );
+  const choosePlan = {
+    org_id: orgId,
+    dev_mode: dev,
+    options,
+    plans: tiers.map((t) => ({
+      tier: t.tier,
+      name: t.name,
+      price: t.price,
+      credits_milli: t.creditsMilli,
+      paid: t.paid,
+    })),
+  };
+
+  // On a terminal, the choice is offered here; anywhere else, the options are the answer.
+  const guide = guideOf(ctx);
+  if (guide.interactive && tiers.length > 0) {
+    const out = await guidedPlan(ctx, guide, { token, orgId, dev, plans: tiers });
+    if (out.ok) {
+      io.emit({ ...out.value.payload, next: "mcp install" }, () => `${out.value.human}\nNext: \`nxis mcp install\`.`);
+      return;
+    }
+    throw needsUser("No plan was chosen; nothing changed. Pick one to continue.", "choose_plan", choosePlan);
+  }
+  throw needsUser("Pick a plan to continue.", "choose_plan", choosePlan);
 }

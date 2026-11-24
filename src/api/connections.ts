@@ -47,6 +47,23 @@ export interface Connection {
   secretRotatedAt: string | null;
   isDefault: boolean;
   usedBy: ConnectionUsage;
+  /**
+   * What the latest test the receiver answered found: true when it answered as an availability
+   * check, false when it answered otherwise; null when it hasn't been tested since its address was
+   * set, or the service doesn't say.
+   */
+  answersChecks: boolean | null;
+}
+
+/** One route that names a connection, with its own options. */
+export interface ConnectionRouteInfo {
+  /** `default`, or a schema.org action type: `QuoteAction` … */
+  actionType: string;
+  connectionId: string;
+  supportsCheck: boolean;
+  availabilityUrl: string;
+  /** The hosted agents whose requests take this route: `quote`, `booking`. */
+  agents: string[];
 }
 
 /** A site's connections, oldest first, and which one is its default. */
@@ -54,6 +71,8 @@ export interface ConnectionList {
   connections: Connection[];
   /** Empty when the site has no default. */
   defaultConnectionId: string;
+  /** Every route that names a connection; empty from a service that doesn't list them. */
+  routes: ConnectionRouteInfo[];
 }
 
 /** A connection with its new raw signing secret, from a create or a rotation only. */
@@ -81,6 +100,17 @@ function text(value: unknown): string {
 /** @returns The strings in an array; empty for anything else. */
 function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
+/**
+ * @returns A `google.protobuf.BoolValue` as sent: a bare boolean, or `{ value }` (an empty object
+ * is false); null when it is absent.
+ */
+export function boolValue(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  const o = object(value);
+  if (o) return o["value"] === true;
+  return null;
 }
 
 /** @returns The enum's name; a number (from a gateway that sends enums as integers) by its name. */
@@ -118,6 +148,19 @@ export function parseConnection(raw: unknown): Connection {
     secretRotatedAt: text(body["secretRotatedAt"]) || null,
     isDefault: body["isDefault"] === true,
     usedBy: { agents: strings(used?.["agents"]), actionTypes: strings(used?.["actionTypes"]) },
+    answersChecks: boolValue(body["answersChecks"]),
+  };
+}
+
+/** @returns One route of a ListConnectionsResponse. */
+function parseRoute(raw: unknown): ConnectionRouteInfo {
+  const r = object(camelKeys(raw)) ?? {};
+  return {
+    actionType: text(r["actionType"]),
+    connectionId: text(r["connectionId"]),
+    supportsCheck: r["supportsCheck"] === true,
+    availabilityUrl: text(r["availabilityUrl"]),
+    agents: strings(r["agents"]),
   };
 }
 
@@ -128,6 +171,7 @@ export function parseConnectionList(raw: unknown): ConnectionList {
   return {
     connections: list.map(parseConnection),
     defaultConnectionId: text(body["default_connection_id"] ?? body["defaultConnectionId"]),
+    routes: (Array.isArray(body["routes"]) ? (body["routes"] as unknown[]) : []).map(parseRoute),
   };
 }
 
@@ -213,6 +257,14 @@ function byReason(
       return failed(message, "invalid_input", { field: INVALID_FIELD[info.reason], ...details });
     case "INVALID_ARGUMENT":
       return failed(message, "invalid_input", details);
+    case "CONNECTION_TEST_RATE_LIMITED": {
+      const after = Number(info.metadata["retry_after_seconds"] ?? "");
+      return failed(message || "This connection was tested moments ago. Try again in a few seconds.", "rate_limited", {
+        site,
+        ...details,
+        ...(Number.isFinite(after) && after > 0 ? { retry_after_seconds: after } : {}),
+      });
+    }
     default:
       return undefined;
   }
@@ -381,4 +433,125 @@ export async function setConnectionRoute(t: SiteRef, route: RouteInput): Promise
     mapped(t.siteId, { connection_id: route.connectionId }, "item"),
   );
   return parseConnectionList(raw ?? {});
+}
+
+/** How a connection's receiver answered a test call. */
+export type TestVerdict = "ok" | "signature_rejected" | "unreachable" | "timeout" | "bad_response";
+
+/**
+ * Who sent a test call's answer: the receiver itself, or a tunnel (ngrok), proxy or load balancer,
+ * or CDN in front of it that answered with its own error page, so the call never got to the
+ * receiver. Another word, from a newer service, is kept as it is.
+ */
+export type AnsweredBy = "receiver" | "tunnel" | "proxy" | "cdn";
+
+/** A test call's outcome, as the service answers it. */
+export interface ConnectionTest {
+  /** The service's verdict; another word, from a newer service, is kept as it is. */
+  verdict: TestVerdict | string;
+  /** The answer's HTTP status (the receiver's, or a tunnel's, proxy's or CDN's); 0 when there was no answer. */
+  httpStatus: number;
+  latencyMs: number;
+  /** The first 300 characters of the receiver's answer. */
+  bodyExcerpt: string;
+  url: string;
+  testedAt: string | null;
+  /** The action type the example arguments were for: `QuoteAction` …, or `default`. */
+  actionType: string;
+  /** Why the receiver gave no answer, for people; empty when it did. */
+  detail: string;
+  /** Who answered; empty when nothing did, or from a service that doesn't say. */
+  answeredBy: AnsweredBy | string;
+  /**
+   * The receiver answered as an availability check: a 2xx with a JSON object holding a boolean
+   * `available`. Null from a service that doesn't say.
+   */
+  answersChecks: boolean | null;
+  /** The check's answer listed open times (`windows`). */
+  returnedWindows: boolean;
+  /** The check's answer carried a `hold`. */
+  returnedHold: boolean;
+  /** The routes on this connection (`default`, `QuoteAction` …) whose check support is off after the call. */
+  checkSupportOff: string[];
+  /** The routes the call turned check support on for. */
+  checkSupportTurnedOn: string[];
+}
+
+/** @returns A number from a JSON number or a numeric string (int64 is sent as a string), else 0. */
+function num(value: unknown): number {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * @returns Whether the receiver answered as a check: the service's word when it gives one, else
+ * read from the start of a 2xx answer, so a service that leaves a false `answers_checks` out (as
+ * proto3 JSON does), or one too old to send it, still gets an answer; null when it can't be told.
+ */
+function answersChecksOf(r: Record<string, unknown>): boolean | null {
+  if (typeof r["answersChecks"] === "boolean") return r["answersChecks"];
+  if (text(r["verdict"]) !== "ok") return null;
+  const excerpt = text(r["bodyExcerpt"]).trim();
+  try {
+    const body = object(JSON.parse(excerpt));
+    return body ? typeof body["available"] === "boolean" : false;
+  } catch {
+    // Cut at 300 characters, or not JSON.
+  }
+  if (/^\{[\s\S]*"available"\s*:\s*(true|false)\b/.test(excerpt)) return true;
+  return excerpt.startsWith("{") || excerpt.startsWith("[") ? null : false;
+}
+
+/** @returns The test result, from snake_case or lowerCamelCase. */
+export function parseConnectionTest(raw: unknown): ConnectionTest {
+  const r = camelKeys(object(raw) ?? {}) as Record<string, unknown>;
+  return {
+    verdict: text(r["verdict"]),
+    httpStatus: num(r["httpStatus"]),
+    latencyMs: num(r["latencyMs"]),
+    bodyExcerpt: text(r["bodyExcerpt"]),
+    url: text(r["url"]),
+    testedAt: text(r["testedAt"]) || null,
+    actionType: text(r["actionType"]),
+    detail: text(r["detail"]),
+    answeredBy: text(r["answeredBy"]),
+    answersChecks: answersChecksOf(r),
+    returnedWindows: r["returnedWindows"] === true,
+    returnedHold: r["returnedHold"] === true,
+    checkSupportOff: strings(r["checkSupportOff"]),
+    checkSupportTurnedOn: strings(r["checkSupportTurnedOn"]),
+  };
+}
+
+/**
+ * Sends one signed check call to a connection's address, from NxisAI, and reports how its
+ * receiver answered. A check commits nothing; the service allows one test per connection every
+ * few seconds.
+ *
+ * @param actionType - The action type the example arguments are for (`QuoteAction` …), or
+ * `default`; omitted, the service picks the connection's own route.
+ * @param opts - `turnOnChecks`: when the receiver answers checks, the service turns check support
+ * on for every route on the connection that has it off, and says which.
+ * @throws CliError `rate_limited` (exit 1), `connection_not_found` (exit 2), and whatever
+ * {@link request} throws.
+ */
+export async function testConnection(
+  t: SiteRef,
+  id: string,
+  actionType?: string,
+  opts: { turnOnChecks?: boolean } = {},
+): Promise<ConnectionTest> {
+  const resource = `${siteParent(t.orgId, t.siteId)}/connections/${id}`;
+  const raw = await request<unknown>(`${connectionUrl(t.config, t.orgId, t.siteId, id)}:test`, {
+    method: "POST",
+    token: t.token,
+    body: {
+      connection: resource,
+      ...(actionType ? { action_type: actionType } : {}),
+      ...(opts.turnOnChecks ? { turn_on_checks: true } : {}),
+    },
+    // The service waits up to 10 seconds for the receiver.
+    timeoutMs: 45_000,
+  }).catch(mapped(t.siteId, { connection_id: id }, "item"));
+  return parseConnectionTest(raw);
 }

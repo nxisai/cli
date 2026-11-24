@@ -222,6 +222,7 @@ describe("connections list", () => {
       secret_rotated_at: "2026-11-20T00:00:00Z",
       is_default: false,
       used_by: { agents: ["quote"], action_types: ["QuoteAction"] },
+      answers_checks: null,
     });
     expectNoSecret(JSON.stringify(out.json));
     expectNoSecret(out.text);
@@ -395,6 +396,17 @@ describe("actions bind --connection", () => {
     expect(out.text).toContain('now sends to connection "Spare"');
   });
 
+  it("turns check support on for the Quote route too", async () => {
+    const { ctx } = capture();
+    await cmdActionsBind(ctx, { action: "quote", connection: "Spare", supportsCheck: true });
+    expect(calls("POST", ":setRoute")[0]?.body).toEqual({
+      parent: `organizations/${ORG}/sites/${SITE}`,
+      connection_id: SPARE_ID,
+      action_type: "QUOTE_ACTION",
+      supports_check: true,
+    });
+  });
+
   it("binds the Booking agent with its options, and the site default", async () => {
     const { ctx } = capture();
     await cmdActionsBind(ctx, { action: "booking", connection: QUOTE_ID, supportsCheck: true, availabilityUrl: "https://api.example.com/free" });
@@ -410,10 +422,10 @@ describe("actions bind --connection", () => {
     expect(dflt).toEqual({ parent: `organizations/${ORG}/sites/${SITE}`, connection_id: SPARE_ID });
   });
 
-  it("refuses Booking's options elsewhere, and booking without a connection, before sending", async () => {
+  it("refuses the free-times address elsewhere, and booking without a connection, before sending", async () => {
     const { ctx } = capture();
     for (const args of [
-      { action: "quote", connection: "Spare", supportsCheck: true },
+      { action: "quote", connection: "Spare", availabilityUrl: "/free" },
       { action: "default", connection: "Spare", availabilityUrl: "" },
       { action: "schedule", selfPage: true, supportsCheck: false },
       { action: "booking", selfPage: true },
@@ -650,15 +662,17 @@ const yesReply: Reply = { action: "accept", content: { confirm: true } };
 
 describe("mcp serve: connection tools", () => {
   it("are listed with the CLI's annotations, and take `site`", () => {
-    const local = TOOLS.filter((t) => t.surface === "local").map((t) => t.name);
+    const connectionTools = TOOLS.filter((t) => t.surface === "local" && t.name.includes("connection"));
+    const local = connectionTools.map((t) => t.name);
     expect(local).toEqual([
       "nxis_list_connections",
       "nxis_create_connection",
       "nxis_bind_connection",
+      "nxis_test_connection",
       "nxis_rotate_connection_secret",
       "nxis_delete_connection",
     ]);
-    for (const tool of TOOLS.filter((t) => t.surface === "local")) {
+    for (const tool of connectionTools) {
       expect(tool.takesSite, tool.name).toBe(true);
       expect(Object.keys(tool.input.shape)).toContain("site");
     }

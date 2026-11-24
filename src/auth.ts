@@ -136,11 +136,15 @@ export async function requestDeviceCode(config: Config): Promise<DeviceCodeGrant
  * `authorization_pending` is the normal state for most of this loop, and `slow_down` is
  * Auth0 telling us to back off — treating either as an error would abort a sign-in that
  * is going fine.
+ *
+ * @param signal - Stops waiting: the person said no where they were asked.
+ * @throws CliError `cancelled` (exit 2) once the signal aborts.
  */
 export async function pollForDeviceToken(
   config: Config,
   grant: DeviceCodeGrant,
   onTick?: (elapsedMs: number) => void,
+  signal?: AbortSignal,
 ): Promise<StoredCredentials> {
   const started = Date.now();
   let intervalMs = (grant.interval ?? 5) * 1000;
@@ -149,6 +153,7 @@ export async function pollForDeviceToken(
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
 
+    if (signal?.aborted) throw needsUser("Stopped waiting for the sign-in.", "cancelled");
     if (Date.now() > deadline) {
       throw needsUser(
         "The sign-in code expired before it was confirmed. Run `nxis login` again.",

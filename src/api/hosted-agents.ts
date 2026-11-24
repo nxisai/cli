@@ -466,6 +466,27 @@ function listOf(value: string | undefined): string[] {
   return (value ?? "").split(",").map((v) => v.trim()).filter(Boolean);
 }
 
+/**
+ * @returns The parts as sentences, one after another: each part ends with a period unless it
+ * already ends a sentence; empty parts are left out.
+ */
+export function sentences(...parts: Array<string | undefined>): string {
+  return parts
+    .map((p) => (p ?? "").trim())
+    .filter((p) => p.length > 0)
+    .map((p) => (/[.!?][)"'\]]*$/.test(p) ? p : `${p}.`))
+    .join(" ");
+}
+
+/**
+ * The note the service adds to a refused enable that had set the agent's route to its connection
+ * first. The route stays; whatever else the request asked for wasn't saved.
+ */
+const ROUTE_KEPT_NOTE = /\s*The agent's route to the connection was set, and stays\.?\s*$/i;
+
+/** What a refused enable kept, in its own sentence. */
+export const ROUTE_KEPT = "The agent's route to the connection was set, and stays; the agent is still off";
+
 /** What a refusal is about, for the mapped error's details. */
 export interface RefusalContext {
   agent: string;
@@ -494,7 +515,12 @@ async function connectionNames(site: SiteRef | undefined): Promise<string[]> {
 export async function mapRefusal(err: unknown, c: RefusalContext): Promise<Error> {
   if (!(err instanceof CliError) || err.reason !== "request_failed") return err as Error;
   if (isMissingRoute(err)) return new HostedAgentsUnavailable();
-  const message = plainText(err.message);
+  const raw = plainText(err.message);
+  // The route the request set stays: say so in a sentence of its own, and in the details.
+  const routeKept = ROUTE_KEPT_NOTE.test(raw);
+  const base = raw.replace(ROUTE_KEPT_NOTE, "");
+  const kept = routeKept ? { kept: ["route"] } : {};
+  const message = routeKept ? sentences(base, ROUTE_KEPT) : base;
   const info = serviceReason(err);
   const code = err.details["rpc_code"];
   const status = err.details["status"];
@@ -523,9 +549,9 @@ export async function mapRefusal(err: unknown, c: RefusalContext): Promise<Error
     case "CONNECTION_REQUIRED": {
       const connections = await connectionNames(c.site);
       const hint = connections.length
-        ? ` Run it again with --connection <name>: ${connections.map((n) => `"${plainText(n)}"`).join(", ")}.`
-        : " The site has no connections yet: create one with `nxis connections create --name <name> --url <https url>`, then run this again with --connection <name>.";
-      return needsUser((message || `${agent} needs a connection to send requests through.`) + hint, "connection_required", {
+        ? `Run it again with --connection <name>: ${connections.map((n) => `"${plainText(n)}"`).join(", ")}.`
+        : "The site has no connections yet: create one with `nxis connections create --name <name> --url <https url>`, then run this again with --connection <name>.";
+      return needsUser(sentences(message || `${agent} needs a connection to send requests through`, hint), "connection_required", {
         agent,
         action_types: listOf(m["action_types"]),
         connections,
@@ -538,13 +564,13 @@ export async function mapRefusal(err: unknown, c: RefusalContext): Promise<Error
         connection: m["connection"] || null,
       });
     case "CONNECTION_UNUSABLE":
-      return needsUser(message, "connection_unusable", { agent, action_type: m["action_type"] || null, ...unmet });
+      return needsUser(message, "connection_unusable", { agent, action_type: m["action_type"] || null, ...unmet, ...kept });
     case "ACTIONS_OFF":
-      return needsUser(message, "actions_off", { agent, ...unmet });
+      return needsUser(message, "actions_off", { agent, ...unmet, ...kept });
     case "RECORDS_MISSING":
-      return needsUser(message, "records_missing", { agent, types: listOf(m["types"]), ...unmet });
+      return needsUser(message, "records_missing", { agent, types: listOf(m["types"]), ...unmet, ...kept });
     case "OPENING_HOURS_REQUIRED":
-      return needsUser(message, "opening_hours_required", { agent, ...unmet });
+      return needsUser(message, "opening_hours_required", { agent, ...unmet, ...kept });
     case "AGENT_CONFIG_CHANGED":
       return versionConflict(c.expectedVersion);
     case "INVALID_ARGUMENT":

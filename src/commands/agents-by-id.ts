@@ -20,6 +20,8 @@ import {
   getHostedAgent,
   HostedAgentsUnavailable,
   listAgentCatalog,
+  ROUTE_KEPT,
+  sentences,
   setHostedAgentEnabled,
   updateHostedAgent,
   type AgentSetupSpec,
@@ -62,13 +64,13 @@ export interface Fallback {
 }
 
 /** @returns The site and token, as the hosted agent calls take them. */
-async function siteRef(ctx: Ctx): Promise<SiteRef> {
+export async function siteRef(ctx: Ctx): Promise<SiteRef> {
   const t = await target(ctx);
   return { config: ctx.config, token: t.token, orgId: t.orgId, siteId: t.siteId };
 }
 
 /** @returns True when http:// URLs are fine: the CLI points at a local stack. */
-function localStack(ctx: Ctx): boolean {
+export function localStack(ctx: Ctx): boolean {
   return /^http:\/\//i.test(ctx.config.endpoints.sites);
 }
 
@@ -99,7 +101,7 @@ async function fallBack(ref: SiteRef, id: string, fallback: Fallback): Promise<v
 }
 
 /** @returns The agent, or null against a service without hosted agents by id. */
-async function readAgent(ref: SiteRef, id: string): Promise<HostedAgentView | null> {
+export async function readAgent(ref: SiteRef, id: string): Promise<HostedAgentView | null> {
   try {
     return await getHostedAgent(ref, id);
   } catch (err) {
@@ -109,7 +111,7 @@ async function readAgent(ref: SiteRef, id: string): Promise<HostedAgentView | nu
 }
 
 /** @returns The agent's setup; `agent_not_hosted` when it has none. */
-function setupOf(view: HostedAgentView): AgentSetupSpec {
+export function setupOf(view: HostedAgentView): AgentSetupSpec {
   if (!view.setup) {
     throw failed(`NxisAI doesn't host "${plainText(view.agent)}" yet.`, "agent_not_hosted", { agent: view.agent, readiness: null });
   }
@@ -117,7 +119,7 @@ function setupOf(view: HostedAgentView): AgentSetupSpec {
 }
 
 /** @returns True when the setup routes the agent's requests through a connection. */
-function needsConnection(setup: AgentSetupSpec): boolean {
+export function needsConnection(setup: AgentSetupSpec): boolean {
   return setup.prerequisites.some((p) => p.kind === "connection");
 }
 
@@ -189,6 +191,44 @@ function strictLegacy(id: string, flags: Flags, reserved: ReadonlySet<string>, c
 }
 
 /**
+ * The settings a write sets, given the agent's setup and the settings it stores: read from flags
+ * on the command line, or from a tool's arguments by setting name.
+ */
+export type SettingsOf = (setup: AgentSetupSpec, stored: Record<string, unknown>, allowHttp: boolean) => Record<string, unknown>;
+
+/** What an enable is given, wherever it came from. */
+export interface EnableInput {
+  settings: SettingsOf;
+  /** A connection's name or id, to route the agent's requests through first. */
+  connection?: string | undefined;
+  /** How refusals name a setting: by flag (the command line) or by name (a tool). */
+  naming?: "flags" | "settings";
+}
+
+/**
+ * Checks an enable against the agent as read, before anything is sent.
+ *
+ * @returns The settings to send, and whether the agent is already on with them.
+ * @throws CliError `agent_not_hosted`; the setting reasons; `unknown_flag` for a connection given
+ * to an agent that sends no requests; `missing_<flag>` for a required setting left empty.
+ */
+export function checkEnable(ctx: Ctx, view: HostedAgentView, input: EnableInput): { settings: Record<string, unknown>; unchanged: boolean } {
+  const setup = setupOf(view);
+  const name = view.displayName || view.agent;
+  const settings = input.settings(setup, view.settings, localStack(ctx));
+  if (input.connection !== undefined && !needsConnection(setup)) {
+    const byName = input.naming === "settings";
+    throw failed(
+      `${plainText(name)} doesn't send requests through a connection, so it takes no ${byName ? "connection" : "--connection"}.`,
+      byName ? "connection_not_taken" : "unknown_flag",
+      byName ? { agent: view.agent, field: "connection" } : { flag: "--connection", allowed: settingFlags(setup) },
+    );
+  }
+  checkRequired(setup, view.settings, settings, name, input.naming ?? "flags");
+  return { settings, unchanged: view.enabled && input.connection === undefined && changesNothing(view.settings, settings) };
+}
+
+/**
  * Runs `nxis agents enable <id> [--<flag> <value>]... [--connection <name|id>]`.
  *
  * @throws CliError the flag reasons of {@link settingsFromFlags} and `missing_<flag>` (exit 1,
@@ -199,8 +239,10 @@ export async function cmdAgentEnable(ctx: Ctx, id: string, flags: Flags, fallbac
   const reserved = reservedWith("connection");
   precheck(id, flags, reserved);
   const connection = connectionFlag(flags);
-  const ref = await siteRef(ctx);
-  await writeAgent(ctx, ref, id, {
+  await enableAgent(ctx, id, {
+    settings: (setup, stored, allowHttp) => settingsFromFlags(setup, flags, { reserved, stored, allowHttp }),
+    connection,
+  }, {
     ...fallback,
     ...(fallback.legacy
       ? {
@@ -213,25 +255,65 @@ export async function cmdAgentEnable(ctx: Ctx, id: string, flags: Flags, fallbac
           },
         }
       : {}),
-  }, (view) => {
-    const setup = setupOf(view);
-    const settings = settingsFromFlags(setup, flags, { reserved, stored: view.settings, allowHttp: localStack(ctx) });
-    if (connection !== undefined && !needsConnection(setup)) {
-      throw failed(`${plainText(view.displayName || id)} doesn't send requests through a connection, so it takes no --connection.`, "unknown_flag", {
-        flag: "--connection",
-        allowed: settingFlags(setup),
-      });
-    }
-    checkRequired(setup, view.settings, settings, view.displayName || id);
-    if (view.enabled && connection === undefined && changesNothing(view.settings, settings)) return null;
-    return () =>
-      setHostedAgentEnabled(ref, id, {
-        enabled: true,
-        settings,
-        ...(connection !== undefined ? { connection } : {}),
-        expectedVersion: view.configVersion,
-      });
   });
+}
+
+/**
+ * Turns one agent on, with its settings and connection in the same save, whatever they came from.
+ *
+ * @throws CliError what {@link checkEnable} throws, and the service's refusals as {@link mapRefusal}
+ * maps them; a refusal that kept the route keeps the settings too.
+ */
+export async function enableAgent(ctx: Ctx, id: string, input: EnableInput, fallback: Fallback): Promise<void> {
+  const ref = await siteRef(ctx);
+  await writeAgent(ctx, ref, id, fallback, (view) => {
+    const { settings, unchanged } = checkEnable(ctx, view, input);
+    if (unchanged) return null;
+    return async () => {
+      try {
+        return await setHostedAgentEnabled(ref, id, {
+          enabled: true,
+          settings,
+          ...(input.connection !== undefined ? { connection: input.connection } : {}),
+          expectedVersion: view.configVersion,
+        });
+      } catch (err) {
+        throw await keepSettingsWithRoute(ref, id, settings, err);
+      }
+    };
+  });
+}
+
+/**
+ * A refused enable that had set the agent's route keeps the route but not the settings sent with
+ * it. Saves those settings too, without turning the agent on, so what the command applied is
+ * consistent, and says so.
+ *
+ * @returns The error to throw: the refusal, saying what was kept.
+ */
+async function keepSettingsWithRoute(ref: SiteRef, id: string, settings: Record<string, unknown>, err: unknown): Promise<unknown> {
+  if (!(err instanceof CliError)) return err;
+  const kept = err.details["kept"];
+  if (!Array.isArray(kept) || !kept.includes("route") || Object.keys(settings).length === 0) return err;
+  const refusal = err.message.replace(sentences(ROUTE_KEPT), "").trim();
+  let message: string;
+  let details: Record<string, unknown>;
+  try {
+    const now = await getHostedAgent(ref, id);
+    if (!changesNothing(now.settings, settings)) {
+      await updateHostedAgent(ref, id, { settings, expectedVersion: now.configVersion });
+    }
+    message = sentences(refusal, "The agent's route to the connection and the settings given were saved, and stay; the agent is still off");
+    details = { ...err.details, kept: ["route", "settings"] };
+  } catch (saveErr) {
+    const why = saveErr instanceof CliError ? saveErr.reason : "request_failed";
+    message = sentences(
+      refusal,
+      `The agent's route to the connection was set, and stays, but the settings given weren't saved (${why}); the agent is still off`,
+    );
+    details = { ...err.details, kept: ["route"], settings_error: why };
+  }
+  return new CliError(message, { exitCode: err.exitCode, reason: err.reason, details });
 }
 
 /**
@@ -250,8 +332,7 @@ export async function cmdAgentConfigure(ctx: Ctx, id: string, flags: Flags, fall
     });
   }
   precheck(id, flags, reserved, clear);
-  const ref = await siteRef(ctx);
-  await writeAgent(ctx, ref, id, {
+  await configureAgent(ctx, id, (setup, stored, allowHttp) => settingsFromFlags(setup, flags, { reserved, clear, stored, allowHttp }), {
     ...fallback,
     ...(fallback.legacy
       ? {
@@ -261,11 +342,40 @@ export async function cmdAgentConfigure(ctx: Ctx, id: string, flags: Flags, fall
           },
         }
       : {}),
-  }, (view) => {
-    const setup = setupOf(view);
-    const settings = settingsFromFlags(setup, flags, { reserved, clear, stored: view.settings, allowHttp: localStack(ctx) });
-    if (view.enabled) checkRequired(setup, view.settings, settings, view.displayName || id);
-    if (changesNothing(view.settings, settings)) return null;
+  });
+}
+
+/**
+ * Checks a change of settings against the agent as read, before anything is sent.
+ *
+ * @returns The settings to send, and whether the agent already has them.
+ * @throws CliError `agent_not_hosted`; the setting reasons; `missing_<flag>` when the agent is on
+ * and a required setting would be left empty.
+ */
+export function checkConfigure(
+  ctx: Ctx,
+  view: HostedAgentView,
+  settingsOf: SettingsOf,
+  naming: "flags" | "settings" = "flags",
+): { settings: Record<string, unknown>; unchanged: boolean } {
+  const setup = setupOf(view);
+  const settings = settingsOf(setup, view.settings, localStack(ctx));
+  if (view.enabled) checkRequired(setup, view.settings, settings, view.displayName || view.agent, naming);
+  return { settings, unchanged: changesNothing(view.settings, settings) };
+}
+
+/** Changes one agent's settings, without turning it on or off, whatever they came from. */
+export async function configureAgent(
+  ctx: Ctx,
+  id: string,
+  settingsOf: SettingsOf,
+  fallback: Fallback,
+  naming: "flags" | "settings" = "flags",
+): Promise<void> {
+  const ref = await siteRef(ctx);
+  await writeAgent(ctx, ref, id, fallback, (view) => {
+    const { settings, unchanged } = checkConfigure(ctx, view, settingsOf, naming);
+    if (unchanged) return null;
     return () => updateHostedAgent(ref, id, { settings, expectedVersion: view.configVersion });
   });
 }
@@ -274,7 +384,7 @@ export async function cmdAgentConfigure(ctx: Ctx, id: string, flags: Flags, fall
 export function clearFlags(flags: Flags): string[] {
   const values = flags.all.get("clear") ?? [];
   if (values.some((v) => typeof v !== "string" || !v.trim())) {
-    throw failed("--clear needs the flag of the setting to clear, such as --clear description.", "missing_value", { flag: "--clear" });
+    throw failed("--clear needs the setting to clear, by its flag or its name, such as --clear description.", "missing_value", { flag: "--clear" });
   }
   return values.map((v) => String(v).trim().replace(/^--/, ""));
 }
@@ -420,6 +530,44 @@ function valueText(value: unknown): string {
   return plainText(JSON.stringify(value) ?? "");
 }
 
+/** Whether a sending agent's route checks with the receiver first, and what to do when it doesn't. */
+export interface CheckSupport {
+  /** The agent's route has check support on. */
+  on: boolean;
+  /** What the connection's latest test found; null when it hasn't been tested. */
+  answers_checks: boolean | null;
+  connection: string;
+  /** For a person: set when check support is off and could be on, or hasn't been tested. */
+  note?: string;
+}
+
+/**
+ * @returns Check support on a sending agent's route (Quote, Booking), from the site's connections;
+ * null for an agent without a connection route, or when they can't be read.
+ */
+export async function checkSupportOf(ref: SiteRef, agent: string): Promise<CheckSupport | null> {
+  if (agent !== "quote" && agent !== "booking") return null;
+  try {
+    const { listConnections } = await import("../api/connections.js");
+    const list = await listConnections(ref);
+    const route = list.routes.find((r) => r.agents.includes(agent));
+    const c = route ? list.connections.find((x) => x.id === route.connectionId) : undefined;
+    if (!route || !c) return null;
+    const name = plainText(c.name);
+    const out: CheckSupport = { on: route.supportsCheck, answers_checks: c.answersChecks, connection: c.name };
+    const command = `\`nxis connections test "${name}" --turn-on-checks\``;
+    if (!route.supportsCheck && c.answersChecks === true) {
+      out.note = `Your receiver answers availability checks, but check support is off for this agent, so it doesn't check first. Turn it on: ${command}.`;
+    } else if (!route.supportsCheck && c.answersChecks === null) {
+      out.note = `Check support is off for this agent, and "${name}" hasn't been tested. ${command} tests it and, if the receiver answers availability checks, turns check support on.`;
+    }
+    return out;
+  } catch {
+    // The write is done; this is extra.
+    return null;
+  }
+}
+
 /** Prints the result of a write. `page` and `support` keep every key their commands always printed. */
 async function emitAgent(ctx: Ctx, ref: SiteRef, before: HostedAgentView, after: HostedAgentView, changed: boolean): Promise<void> {
   void before;
@@ -437,9 +585,10 @@ async function emitAgent(ctx: Ctx, ref: SiteRef, before: HostedAgentView, after:
       // The write is done; the older keys are extra.
     }
   }
+  const checks = changed && after.enabled ? await checkSupportOf(ref, after.agent) : null;
   ctx.io.emit(
-    { ...base, changed, agent: agentJson(after), ...(next ? { next } : {}) },
-    () => `${lead}\n${agentText(after)}${next ? `\n\nNext: ${next}` : ""}${extra}`,
+    { ...base, changed, agent: agentJson(after), ...(next ? { next } : {}), ...(checks ? { check_support: checks } : {}) },
+    () => `${lead}\n${agentText(after)}${next ? `\n\nNext: ${next}` : ""}${checks?.note ? `\n\n${checks.note}` : ""}${extra}`,
   );
 }
 

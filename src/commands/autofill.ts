@@ -27,6 +27,9 @@ import { rememberJobs, siteJobs } from "../jobs.js";
 import { bold, dim, formatCredits } from "../output.js";
 import { confirmOrStop, terminalAsker, type Asker } from "../prompt.js";
 import { isDryRun } from "../trace.js";
+import { guideOf, noGuide, refused } from "../guide.js";
+import { chooseScope, siteClusters } from "../guided/scope.js";
+import { checkCredits, readBalanceMilli } from "../guided/credits.js";
 import { bulkAutofill, type BulkAutofillResult, type RecentBatch } from "../tools/provisioning.js";
 import { minutes, orNull, POLL_INTERVAL_MS, waitFor, withSiteSession, type SiteSession } from "./data-shared.js";
 
@@ -184,8 +187,22 @@ function scopeLabel(plan: Plan): string {
   return [plan.media_type, plan.pattern].filter(Boolean).join(" · ") || "all resources";
 }
 
-/** @returns The plan in lines, for a person. */
-export function planLines(plan: Plan): string[] {
+/**
+ * @returns What the batch would cost, in milli-credits: only for a pure import, whose price per
+ * page is fixed; null otherwise.
+ */
+export function estimateMilli(plan: Plan): number | null {
+  if (plan.import_cost_per_resource_milli === null || plan.planned_count === null) return null;
+  return plan.import_cost_per_resource_milli * plan.planned_count;
+}
+
+/**
+ * @returns The plan in lines, for a person.
+ *
+ * @param balanceMilli - The organization's real credit balance, as `nxis credits` reads it. Shown
+ * in place of the plan's own `credits_remaining` when known.
+ */
+export function planLines(plan: Plan, balanceMilli: number | null = null): string[] {
   const n = (v: number | null) => (v === null ? "unknown" : v.toLocaleString("en-US"));
   const breakdown = plan.by_media
     .filter((b) => b.count > 0)
@@ -198,10 +215,14 @@ export function planLines(plan: Plan): string[] {
     `  Resources  ${bold(n(plan.planned_count))}${plan.planned_count_is_upper_bound ? " at most" : ""}` +
       (plan.site_total !== null && plan.planned_count !== plan.site_total ? ` of ${n(plan.site_total)}` : "") +
       (breakdown ? dim(`  (site: ${breakdown})`) : ""),
-    `  Credits    ${bold(n(plan.credits_remaining))} remaining`,
+    balanceMilli !== null
+      ? `  Credits    ${bold(formatCredits(balanceMilli))} balance`
+      : `  Credits    ${bold(n(plan.credits_remaining))} remaining`,
   ];
   if (plan.import_cost_per_resource_milli !== null) {
     lines.push(`  Price      ${formatCredits(plan.import_cost_per_resource_milli)} per page, fixed`);
+    const estimate = estimateMilli(plan);
+    if (estimate !== null) lines.push(`  Estimate   ${formatCredits(estimate)}`);
   } else {
     lines.push(`  Price      varies per page, so no total is estimated`);
   }
@@ -261,11 +282,13 @@ async function readStatus(ctx: Ctx, s: SiteSession, batchId: string): Promise<St
 export async function cmdAutofillPlan(ctx: Ctx, scope: AutofillScope = {}): Promise<void> {
   await withSiteSession(ctx, async (s) => {
     const plan = await readPlan(ctx, s, scope);
-    ctx.io.emit({ ok: true, ...plan }, () => {
+    // The balance `nxis credits` reads; the plan's own `credits_remaining` can overstate it.
+    const balance = await readBalanceMilli(ctx, s.orgId);
+    ctx.io.emit({ ok: true, ...plan, balance_milli: balance }, () => {
       const flags = scopeFlags(plan);
       return [
         bold("Structured data plan"),
-        ...planLines(plan),
+        ...planLines(plan, balance),
         "",
         `Narrow it with --media-type HTML|IMAGE|VIDEO|AUDIO or --pattern '/products/*', then run`,
         `\`nxis autofill submit${flags ? ` ${flags}` : ""}\`. It spends credits and asks first.`,
@@ -292,7 +315,10 @@ function maybeLanded(err: unknown): boolean {
  *
  * @remarks
  * Plans first, refuses what would start nothing useful (no resources, a scope the plan cannot
- * count, an exhausted balance), asks for a yes, then calls `submit` exactly once.
+ * count), then reads the organization's real balance: used up, or short of a known estimate, a
+ * terminal offers the credit packs (and waits for the payment) before anything else; without one,
+ * a used-up balance stops with `credits_exhausted`. Then it asks for a yes, and calls `submit`
+ * exactly once.
  *
  * @throws CliError `confirmation_required` (exit 2, with the plan) without a terminal or `--yes`;
  * `cancelled` (exit 2) on anything but a yes; `nothing_planned`, `scope_not_counted` or
@@ -301,11 +327,38 @@ function maybeLanded(err: unknown): boolean {
  */
 export async function cmdAutofillSubmit(ctx: Ctx, args: AutofillSubmitArgs = {}): Promise<void> {
   await withSiteSession(ctx, async (s) => {
-    const plan = await readPlan(ctx, s, args);
+    const guide = args.yes ? noGuide("terminal") : guideOf(ctx);
+    let scope: AutofillScope = args;
+    let plan = await readPlan(ctx, s, scope);
+    // No scope given: a terminal offers the site's path clusters, with counts, beside all pages.
+    if (!isDryRun() && guide.interactive && !args.pattern && !args.mediaType) {
+      const found = await siteClusters(ctx, s.orgId, s.siteId);
+      const picked = await chooseScope(
+        guide,
+        { host: s.host, allCount: plan.planned_count, perPageMilli: plan.import_cost_per_resource_milli },
+        found,
+      );
+      if (!picked.ok) throw refused(guide, picked.why, "Cancelled. Nothing was submitted.", { plan });
+      if (picked.value) {
+        scope = { ...args, pattern: picked.value };
+        plan = await readPlan(ctx, s, scope);
+      }
+    }
     refuseUnplannable(plan);
-    await confirmSpend(ctx, plan, args);
+    // The real balance, not the plan's: short or used up, the packs are offered before anything is asked.
+    const credits = isDryRun()
+      ? { balanceMilli: null }
+      : await checkCredits(ctx, guide, {
+          orgId: s.orgId,
+          host: s.host,
+          estimateMilli: estimateMilli(plan),
+          planQuotaExceeded: plan.quota_exceeded,
+          ...(args.timeoutMinutes !== undefined ? { timeoutMinutes: args.timeoutMinutes } : {}),
+          details: { plan },
+        });
+    await confirmSpend(ctx, plan, args, credits.balanceMilli);
 
-    const sent = { mode: "submit" as const, site: s.siteId, ...scopeArgs(args) };
+    const sent = { mode: "submit" as const, site: s.siteId, ...scopeArgs(scope) };
     const sentAt = Date.now();
     let data: BulkAutofillResult;
     try {
@@ -406,28 +459,20 @@ function refuseUnplannable(plan: Plan): void {
       { plan },
     );
   }
-  if (plan.quota_exceeded) {
-    throw needsUser(
-      "The organization's credit balance is used up, so a batch would pause at once and block the next " +
-        "one. Buy credits first: `nxis credits packs`, then `nxis credits buy <sku>`.",
-      "credits_exhausted",
-      { plan },
-    );
-  }
 }
 
 /** Asks for a yes, or stops when nobody can give one. A dry run sends nothing, so it does not ask. */
-async function confirmSpend(ctx: Ctx, plan: Plan, args: AutofillSubmitArgs): Promise<void> {
+async function confirmSpend(ctx: Ctx, plan: Plan, args: AutofillSubmitArgs, balanceMilli: number | null): Promise<void> {
   if (args.yes || isDryRun()) return;
   const count = plan.planned_count?.toLocaleString("en-US") ?? "?";
   await confirmOrStop(args.asker ?? terminalAsker, {
-    summary: [bold("Generate structured data"), ...planLines(plan)].join("\n"),
+    summary: [bold("Generate structured data"), ...planLines(plan, balanceMilli)].join("\n"),
     needsYes: "This spends credits, so it needs a yes. Show the user the plan, then run again with --yes.",
     question:
       `Submit ${count} resource${plan.planned_count === 1 ? "" : "s"} (${plan.existing}, ${scopeLabel(plan)})? ` +
       "This spends credits.",
     cancelled: "Cancelled. Nothing was submitted.",
-    details: { plan },
+    details: { plan, balance_milli: balanceMilli },
   });
 }
 

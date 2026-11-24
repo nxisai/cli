@@ -11,7 +11,7 @@
 import { loginViaBrowser, pollForDeviceToken, requestDeviceCode } from "../auth.js";
 import { openUrl } from "../browser.js";
 import type { Ctx } from "../context.js";
-import { saveCredentials } from "../credentials.js";
+import { saveCredentials, type StoredCredentials } from "../credentials.js";
 import { needsUser } from "../errors.js";
 import { bold } from "../output.js";
 import { refreshAccessToken } from "../auth.js";
@@ -32,19 +32,38 @@ export interface LoginArgs {
  * @throws CliError `no_account_claim` (exit 2) when the claim is still missing after a refresh.
  */
 export async function cmdLogin(ctx: Ctx, args: LoginArgs): Promise<void> {
-  const { config, io } = ctx;
+  const { io } = ctx;
+  const creds = args.web ? await loginViaBrowser(ctx.config) : await deviceLogin(ctx);
+  const { accountId, email, newAccount } = await completeSignIn(ctx, creds);
 
-  let creds = args.web
-    ? await loginViaBrowser(config)
-    : await deviceLogin(ctx);
+  io.emit(
+    { ok: true, account_id: accountId, email, new_account: newAccount },
+    () => `Signed in${email ? ` as ${bold(email)}` : ""}.`,
+  );
+}
 
+/** Who signed in. */
+export interface SignedIn {
+  accountId: string;
+  email: string | null;
+  newAccount: boolean;
+}
+
+/**
+ * Finishes a sign-in: picks up the account claim if the first token lacks it, and stores the
+ * credentials.
+ *
+ * @throws CliError `no_account_claim` (exit 2) when the claim is still missing after a refresh.
+ */
+export async function completeSignIn(ctx: Ctx, first: StoredCredentials): Promise<SignedIn> {
+  let creds = first;
   let claims = decodeJwt(creds.accessToken);
   let accountId = accountIdFromClaims(claims);
 
   let newAccount = false;
   if (!accountId && creds.refreshToken) {
-    io.note("Finishing account setup…");
-    creds = await refreshAccessToken(config, creds.refreshToken);
+    ctx.io.note("Finishing account setup…");
+    creds = await refreshAccessToken(ctx.config, creds.refreshToken);
     claims = decodeJwt(creds.accessToken);
     accountId = accountIdFromClaims(claims);
     newAccount = accountId !== null;
@@ -59,13 +78,7 @@ export async function cmdLogin(ctx: Ctx, args: LoginArgs): Promise<void> {
       "no_account_claim",
     );
   }
-
-  const email = emailFromClaims(claims);
-
-  io.emit(
-    { ok: true, account_id: accountId, email, new_account: newAccount },
-    () => `Signed in${email ? ` as ${bold(email)}` : ""}.`,
-  );
+  return { accountId, email: emailFromClaims(claims), newAccount };
 }
 
 /**

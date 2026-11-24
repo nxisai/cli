@@ -245,7 +245,7 @@ function expectOnlyFrames(stdout: string): void {
 }
 
 describe("nxis mcp serve", () => {
-  it("lists all 21 tools with the server's names and schemas, and their annotations", async () => {
+  it("lists all 35 tools with the server's names and schemas, and their annotations", async () => {
     const s = await serve();
     try {
       expect(s.client.getServerVersion()?.name).toBe("nxis-onboarding");
@@ -254,7 +254,7 @@ describe("nxis mcp serve", () => {
 
       const { tools } = await s.client.listTools();
       expect(tools.map((t) => t.name)).toEqual(TOOLS.map((t) => t.name));
-      expect(tools).toHaveLength(21);
+      expect(tools).toHaveLength(35);
       for (const tool of tools) {
         const def = TOOLS.find((t) => t.name === tool.name)!;
         expect(tool.description).toBe(def.description);
@@ -341,6 +341,14 @@ describe("nxis mcp serve", () => {
         arguments: { site: "site-1", mode: "nope" },
       })) as CallToolResult;
       expect(invalid.isError).toBe(true);
+
+      // So does an argument the tool doesn't define, rather than dropping it.
+      const unknown = (await s.client.callTool({
+        name: "nxis_crawl_sitemap",
+        arguments: { site: "site-1", mode: "status", write_env: ".env.local" },
+      })) as CallToolResult;
+      expect(unknown.isError).toBe(true);
+      expect(JSON.stringify(unknown.content)).toContain("write_env");
 
       // Still serving.
       const after = (await s.client.callTool({ name: "nxis_list_sites", arguments: {} })) as CallToolResult;

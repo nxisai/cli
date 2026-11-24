@@ -7,18 +7,22 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+/** A config directory of the tests' own, so nothing reads or writes the real one. */
+const configHome = mkdtempSync(join(tmpdir(), "nxis-flags-"));
 
 /** Runs the built CLI, returning stdout and the exit code. */
 function run(args: string[]): { out: string; code: number } {
   try {
     const out = execFileSync(process.execPath, [cli, ...args], {
       encoding: "utf8",
-      env: { ...process.env, NXIS_API: "https://api.invalid.test" },
+      env: { ...process.env, NXIS_API: "https://api.invalid.test", XDG_CONFIG_HOME: configHome, NXIS_NO_KEYCHAIN: "1" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     return { out, code: 0 };
@@ -52,5 +56,32 @@ describe.skipIf(!existsSync(cli))("--version", () => {
     const { out, code } = run(["--version"]);
     expect(code).toBe(0);
     expect(out.trim()).toMatch(/^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/);
+  });
+});
+
+describe.skipIf(!existsSync(cli))("unknown flags", () => {
+  it("refuses one before anything is read, saved or sent, with --json", () => {
+    const { out, code } = run([
+      "connections",
+      "create",
+      "--name",
+      "web",
+      "--url",
+      "https://example.com",
+      "--write-envv",
+      ".env.local",
+      "--json",
+    ]);
+    expect(code).toBe(1);
+    const body = JSON.parse(out) as Record<string, unknown>;
+    expect(body).toMatchObject({ ok: false, reason: "unknown_flag", flag: "--write-envv" });
+    expect(body["error"]).toContain("Did you mean --write-env?");
+    expect((body["known_flags"] as string[])[0]).toBe("--write-env");
+  });
+
+  it("refuses one written before the command, too", () => {
+    const { code, out } = run(["--json", "--bogus=1", "whoami"]);
+    expect(code).toBe(1);
+    expect(JSON.parse(out)).toMatchObject({ reason: "unknown_flag", flag: "--bogus", command: "whoami" });
   });
 });

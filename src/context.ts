@@ -4,6 +4,7 @@
 
 import { getAccessToken } from "./auth.js";
 import type { Config } from "./config.js";
+import type { Guide } from "./guide.js";
 import { notAuthorized, needsUser } from "./errors.js";
 import type { Io } from "./output.js";
 import { loadSettings } from "./state.js";
@@ -17,6 +18,11 @@ export interface Ctx {
   orgOverride?: string;
   /** --site, when given, overrides the saved active site. An id or a domain. */
   siteOverride?: string;
+  /**
+   * How to put a decision to the user. `nxis mcp serve` sets it to ask through the agent (or to
+   * nobody, when the client cannot be asked); unset, a command asks on the terminal, when there is one.
+   */
+  guide?: Guide;
 }
 
 /** A signed-in user. */

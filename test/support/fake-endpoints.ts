@@ -62,6 +62,14 @@ export const fake = {
   sitesCalls: [] as AuthSeen[],
   /** Answers them; without one, they get 404. */
   sites: null as AuthResponder | null,
+  /** Requests to the billing service: `/v1/tiers`, `/v1/credits:packs`, and the organization's subscription and quotas. */
+  billingCalls: [] as AuthSeen[],
+  /** Answers them; without one, they get 404. */
+  billing: null as AuthResponder | null,
+  /** Requests to the accounts service: `/v1alpha/accounts/…` and `/v1alpha/organizations/…`. */
+  accountsCalls: [] as AuthSeen[],
+  /** Answers them; without one, they get 404. */
+  accounts: null as AuthResponder | null,
 };
 
 let base = "";
@@ -120,10 +128,32 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     res.end(answer.body === undefined ? "" : JSON.stringify(answer.body));
     return;
   }
-  if (url.startsWith(`/v1/organizations/${ORG}/sites/`) || url.startsWith(`/v1/organizations/${ORG}/agentNotices`)) {
+  if (url.startsWith("/v1alpha/")) {
+    const seen: AuthSeen = { method: req.method ?? "", url, body: await readBody(req) };
+    fake.accountsCalls.push(seen);
+    const answer = fake.accounts?.(seen) ?? { status: 404 };
+    res.writeHead(answer.status, { "content-type": "application/json" });
+    res.end(answer.body === undefined ? "" : JSON.stringify(answer.body));
+    return;
+  }
+  // Any organization's, so a test can see which one a call acted on.
+  if (/^\/v1\/organizations\/[^/]+\/(sites\/|agentNotices)/.test(url)) {
     const seen: AuthSeen = { method: req.method ?? "", url, body: await readBody(req) };
     fake.sitesCalls.push(seen);
     const answer = fake.sites?.(seen) ?? { status: 404 };
+    res.writeHead(answer.status, { "content-type": "application/json" });
+    res.end(answer.body === undefined ? "" : JSON.stringify(answer.body));
+    return;
+  }
+  if (
+    url.startsWith("/v1/tiers") ||
+    url.startsWith("/v1/credits") ||
+    url.startsWith(`/v1/organizations/${ORG}/subscriptions`) ||
+    url.startsWith(`/v1/organizations/${ORG}/quotas`)
+  ) {
+    const seen: AuthSeen = { method: req.method ?? "", url, body: await readBody(req) };
+    fake.billingCalls.push(seen);
+    const answer = fake.billing?.(seen) ?? { status: 404 };
     res.writeHead(answer.status, { "content-type": "application/json" });
     res.end(answer.body === undefined ? "" : JSON.stringify(answer.body));
     return;
@@ -187,6 +217,10 @@ export function resetFake(): void {
   fake.auth = null;
   fake.sitesCalls = [];
   fake.sites = null;
+  fake.billingCalls = [];
+  fake.billing = null;
+  fake.accountsCalls = [];
+  fake.accounts = null;
   saveProvisioningKey({
     apiKey: KEY,
     keyId: "key-1",

@@ -345,6 +345,7 @@ describe("autofill plan", () => {
       import_cost_per_resource_milli: null,
       quota_exceeded: false,
       note: null,
+      balance_milli: null,
     });
   });
 

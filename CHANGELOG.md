@@ -9,6 +9,127 @@ published under the `beta` dist-tag; a plain version, under `latest`.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-24
+
+The first release on npm's `latest` dist-tag since 0.1.0-beta.2. Upgrading from it also brings
+everything in 0.2.0-beta.0 and 0.2.0-beta.1 (their sections of `CHANGELOG.md`): connections,
+`nxis actions bind --connection`, and every hosted agent by its catalog id.
+
+**Upgrading: unknown flags are refused.** A flag the command doesn't take is no longer ignored. The
+command stops before anything is read, saved or sent, with exit `1` and `unknown_flag` (see
+Changed). A script that passes a misspelled flag, or a flag another command takes, now fails
+where it used to run without it.
+
+### Added
+
+- **`nxis connections test` says whether the receiver answers availability checks**
+  (`answers_checks`, and `returned_windows` and `returned_hold` for a booking check) and which
+  routes on the connection have check support off (`check_support_off`). When it answers checks
+  and some routes have it off, the CLI asks on a terminal whether to turn it on, and elsewhere
+  `next` gives the command; **`--turn-on-checks`** (and `turn_on_checks` on the
+  `nxis_test_connection` tool) turns it on without asking. A 2xx that isn't a check answer says
+  the agents won't check first, and how to add check mode. `nxis agents enable` notes when the
+  agent's route could check first and doesn't.
+
+- **Hosted agent tools in `nxis mcp serve`**, so turning agents on runs entirely through the
+  agent: `nxis_agents_status`, `nxis_agents_catalog` (one agent's settings as typed fields, its
+  prerequisites, `unmet` and `enable_with`), `nxis_enable_agent`, `nxis_configure_agent`,
+  `nxis_disable_agent`, `nxis_pause_agents`, `nxis_resume_agents` and `nxis_agents_brand`. They run
+  the `nxis agents` commands' own code and answer with their `--json` objects. Settings are given
+  by name and checked against the agent's setup with the flags' limits and reasons
+  (`unknown_setting`, `invalid_<setting>`, `<setting>_too_long`, `missing_<setting>` …). Before an
+  enable the server asks which connection the agent sends through, when it needs one and none is
+  given, offers the data processing agreement (for the organization, or the site's legal entity),
+  and then confirms; changing an agent that is on, turning one off, resuming and branding are
+  confirmed too, and a pause never is. A refusal carries its reason, the unmet prerequisites,
+  what was kept, and `next`, the tool call that meets it.
+- **Organization tools in `nxis mcp serve`**: `nxis_list_orgs`, `nxis_use_org` (no confirmation)
+  and `nxis_create_org` (confirmed; reuses the unnamed organization a browser sign-up left, as
+  `nxis orgs create` does). The choice is saved, and the server's next call acts on it with no
+  restart; a server started with `--org` refuses to switch (`org_pinned`).
+- `nxis orgs list --json` says which organization is current: `current_org_id`, and `current` on
+  each. The `*` in its table now marks the saved organization too, not only `--org`.
+  `nxis orgs use` also takes the organization's exact name.
+- **`nxis connections test <name|id> [--action <type>]`**, and the `nxis_test_connection` tool in
+  `nxis mcp serve`. NxisAI sends one signed check call to the connection's address, signed as real
+  requests are, and the CLI reports the verdict (`ok`, `signature_rejected`, `unreachable`,
+  `timeout` or `bad_response`), the HTTP status, the latency, the address and the start of the
+  answer, with the next step for each failure. A check commits nothing, so the tool needs no
+  confirmation. Exit `0` on `ok`, `2` on any other verdict, `1` on an error. When a tunnel, proxy
+  or CDN in front of the receiver answers with its own error page (ngrok's 502 when the server
+  behind the tunnel is down), the verdict is `unreachable` with `answered_by` (`tunnel`, `proxy`
+  or `cdn`), and the next step says the tunnel or host is up but not reaching your server.
+- **`nxis connections create … --write-env <file> [--env-name <var>]`** and **`nxis connections
+  rotate <name|id> --write-env <file> [--env-name <var>]`** write the new signing secret into an env
+  file (as `NXIS_ACTION_SECRET` unless `--env-name` names another variable) instead of printing it.
+  The file is checked before the secret is issued, and before `rotate` asks: inside a git
+  repository, a tracked file is refused (`env_file_tracked`) and so is one git doesn't ignore
+  (`env_file_not_ignored`), with nothing sent. The file is written with mode `600`; the variable's
+  line is replaced or added, and every other line is kept. Neither the text nor `--json` carries the
+  secret: they give `written_to`, `env_name`, `secret_preview`, `git` and `next`. A write that fails
+  after the secret was issued is `env_write_failed`, with the `rotate` command that issues a new
+  one. `nxis_create_connection` and `nxis_rotate_connection_secret` in `nxis mcp serve` take
+  `write_env` and `env_name`.
+- **Guided setup prompts.** The decisions only you can make are put to you as prompts, on a
+  terminal and, through `nxis mcp serve`, over MCP elicitation in your agent, instead of stopping
+  with a reason to resolve elsewhere. Nothing is preselected, and no prompt asks for or shows a
+  password, card details or a secret.
+  - **Sign-in.** A command that needs a sign-in offers one: the sign-in link and code, a wait, and
+    the command runs again, once. Through `nxis mcp serve`, any call does the same, as a link the
+    client opens where it supports URL elicitation. `--json`, `--yes` and clients that can't ask
+    keep `signed_out` (exit `3`).
+  - **Plan.** `nxis signup`, and `nxis subscribe` with no tier, offer the plans with their price,
+    interval and credit grant; a paid plan opens its payment page and waits. The new
+    `nxis_choose_plan` tool does the same through the agent. Without a prompt, `choose_plan` and
+    `missing_tier` stay as they were, and a client that can't ask gets `confirmation_unavailable`
+    with `would_do` and `terminal_command`.
+  - **Credits.** Before `nxis autofill submit` (and an `nxis_bulk_autofill` submit through the
+    agent), the real balance, as `nxis credits` reads it, is compared with the plan's estimate. Used
+    up or short, the credit packs are offered; a pack opens its payment page, and once the credits
+    land the submit carries on, once. A used-up balance is never submitted into: without a prompt,
+    it stops with `credits_exhausted`. The plan's own `credits_remaining` is no longer what decides
+    or what the confirmation shows.
+  - **Agreement.** `nxis agents enable` offers the data processing agreement when the site's
+    agents wait on it: its version and link, then accept for the organization, for the site's
+    legal entity, or cancel. The new `nxis_accept_dpa` tool does the same through the agent.
+  - **Autofill scope.** `nxis autofill submit` with no scope, and an `nxis_bulk_autofill` submit
+    through the agent, offer the site's path clusters with their counts beside all pages; the
+    confirmation then names the chosen cluster's own count.
+
+### Changed
+
+- **`nxis actions bind --supports-check` works on every route**, and `supports_check` on the
+  `nxis_bind_connection` tool: the Quote agent checks the service area as Booking checks times.
+  `--availability-url` stays a Booking option.
+- **Unknown flags are refused.** A flag the command doesn't take used to be ignored, so a typo, or
+  a flag from a newer release run on an older one, ran a different command than the one asked
+  for: `connections create … --write-env .env.local` on a release without `--write-env` created
+  the connection and printed its signing secret. Now the command stops before anything is read,
+  saved or sent, with exit `1` and `unknown_flag`; `--json` gives `flag`, `command` and
+  `known_flags`, closest match first, and the message suggests it ("Did you mean --write-env?").
+  The global flags (`--json`, `--verbose`, `--dry-run`, `--api`, `--profile`, `--org`, `--site`,
+  `--no-open`, `--timeout`, `--yes`, `--help`, `--version`) are taken everywhere. `agents enable`
+  and `agents configure` check an agent's settings against its own setup, as before, and their
+  `unknown_flag` now carries `known_flags` too.
+- **`nxis --help`** lists every flag on the lines of the command that takes it, including some it
+  left out (`signup --name --website --dev`, `plans --dev`, `orgs create --industry`,
+  `types --limit`, `query --exact --page-token`, `sites tag --domain --webmcp-mode`,
+  `mcp install --stdio`), and only the global flags under Options.
+
+### Fixed
+
+- **`nxis agents configure <id> --clear <setting>` takes the setting's name**, as `agents status`
+  and `agents catalog <id>` show it (`--clear examples`), as well as its flag (`--clear example`).
+  It used to refuse the name with `unknown_flag`.
+- **A refused `nxis agents enable` keeps the settings it was given.** When the service refuses to
+  turn an agent on (`records_missing`, for one) after it has set the agent's route to the
+  connection, the route stays, and the CLI now saves the settings given too, leaving the agent off.
+  The refusal says so in its own sentence and carries `kept` (`["route", "settings"]`); if saving
+  the settings fails, `kept` is `["route"]` and `settings_error` gives the reason.
+- **`nxis types`, `nxis query` and the site tools in `nxis mcp serve` read from the stack `--api`
+  points at.** Against a stack other than production, they used to read the site from its
+  production address and fail with `site_mcp_not_public`. `NXIS_SITE_MCP_URL` still overrides it.
+
 ## [0.2.0-beta.1] - 2026-11-23
 
 ### Added

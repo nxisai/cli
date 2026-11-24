@@ -16,6 +16,7 @@ import type { AgentSetupSpec, SettingField } from "../api/hosted-agents.js";
 import type { Flags } from "../args.js";
 import { failed } from "../errors.js";
 import { plainText } from "../output.js";
+import { byCloseness, GLOBAL_FLAGS } from "../command-flags.js";
 
 /**
  * The settings of the on-page assistant and the Support Agent that the CLI has always taken, with
@@ -52,26 +53,8 @@ function field(f: Partial<SettingField> & Pick<SettingField, "name" | "type" | "
   };
 }
 
-/**
- * Flags every command takes. A setting whose flag is one of these, or one of the command's own
- * (`--connection`, `--clear`), can't be given on the command line.
- */
-export const GLOBAL_FLAGS: ReadonlySet<string> = new Set([
-  "json",
-  "verbose",
-  "dry-run",
-  "api",
-  "profile",
-  "org",
-  "site",
-  "no-open",
-  "timeout",
-  "yes",
-  "h",
-  "help",
-  "v",
-  "version",
-]);
+/** Flags every command takes, from the command table. A setting can't use one of them as its flag. */
+export { GLOBAL_FLAGS };
 
 /** @returns The global flags, and these. */
 export function reservedWith(...own: string[]): ReadonlySet<string> {
@@ -99,7 +82,7 @@ const INTEGER = /^[+-]?\d+$/;
 export interface FromFlagsOptions {
   /** Flags that aren't settings for this command. */
   reserved?: ReadonlySet<string>;
-  /** Setting flags to return to their default (`--clear <flag>`). */
+  /** Settings to return to their default (`--clear <flag>`), by flag or by setting name. */
   clear?: string[];
   /** Skip flags this setup doesn't name, rather than refusing them (a first pass with {@link KNOWN_SETTINGS}). */
   onlyKnown?: boolean;
@@ -133,7 +116,11 @@ export function settingsFromFlags(setup: AgentSetupSpec, flags: Flags, opts: Fro
     throw failed(
       `--${plainText(flag)} isn't a setting of this agent${extra}. It takes ${settingFlags(setup).join(", ") || "no settings"}.`,
       "unknown_flag",
-      { flag: `--${flag}`, allowed: settingFlags(setup) },
+      {
+        flag: `--${flag}`,
+        allowed: settingFlags(setup),
+        known_flags: byCloseness(`--${flag}`, settingFlags(setup)),
+      },
     );
   };
 
@@ -145,12 +132,14 @@ export function settingsFromFlags(setup: AgentSetupSpec, flags: Flags, opts: Fro
       unknown(flag);
       continue;
     }
-    settings[f.name] = valueOf(f, flags.all.get(flag) ?? [], opts);
+    settings[f.name] = valueOf(f, flags.all.get(flag) ?? [], opts, flagNaming(f));
   }
 
+  // `--clear` takes the flag (`example`) or the setting's name as `agents status` shows it (`examples`).
+  const byName = new Map(setup.settings.flatMap((f) => [[f.name, f] as const, [f.name.replace(/_/g, "-"), f] as const]));
   for (const raw of opts.clear ?? []) {
     const flag = raw.replace(/^--/, "").trim();
-    const f = byFlag.get(flag);
+    const f = byFlag.get(flag) ?? byName.get(flag);
     if (!f) {
       if (opts.onlyKnown) continue;
       unknown(flag, " to clear");
@@ -164,17 +153,121 @@ export function settingsFromFlags(setup: AgentSetupSpec, flags: Flags, opts: Fro
   return settings;
 }
 
-/** @returns The value one setting's flag gives, checked. */
-function valueOf(f: SettingField, given: Array<string | boolean>, opts: FromFlagsOptions): unknown {
+/** A setting's value as a tool takes it: text, a number, true or false, or a list of text. */
+export type SettingValue = string | number | boolean | string[];
+
+/**
+ * The settings a tool's arguments set, by setting name, checked against the setup with the same
+ * rules as {@link settingsFromFlags}.
+ *
+ * @remarks
+ * Each value is checked as its flag's value would be: a list for a `string_list`, a whole number
+ * for an `integer`, true or false for a `boolean`, and text for the rest (a number or a boolean is
+ * taken as its text where text is expected only for `integer` and `boolean`). A refusal names
+ * `settings.<name>` and has the same reason as the flag's, so `invalid_slot_minutes` means the same
+ * thing from a terminal and from an agent. `clear` takes setting names (or flags).
+ *
+ * @returns Settings by name, as the service takes them: `null` for one cleared.
+ * @throws CliError (exit 1, before anything is sent) `unknown_setting`, `conflicting_settings`,
+ * and the value reasons of {@link settingsFromFlags}.
+ */
+export function settingsFromValues(
+  setup: AgentSetupSpec,
+  values: Record<string, SettingValue>,
+  opts: Omit<FromFlagsOptions, "reserved" | "onlyKnown"> = {},
+): Record<string, unknown> {
+  const names = setup.settings.map((f) => f.name);
+  const byName = new Map(
+    setup.settings.flatMap((f) => [[f.name, f] as const, [f.name.replace(/_/g, "-"), f] as const, [f.flag, f] as const]),
+  );
+  const unknown = (key: string, extra = ""): never => {
+    throw failed(
+      `"${plainText(key)}" isn't a setting of this agent${extra}. It takes ${names.join(", ") || "no settings"}.`,
+      "unknown_setting",
+      { field: `settings.${key}`, setting: key, allowed: names, known_settings: byCloseness(key, names) },
+    );
+  };
+
+  const settings: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(values)) {
+    const f = byName.get(key.trim());
+    if (!f) return unknown(key);
+    if (Object.prototype.hasOwnProperty.call(settings, f.name)) {
+      throw failed(`settings.${f.name} was given twice.`, "conflicting_settings", { field: `settings.${f.name}`, setting: f.name });
+    }
+    settings[f.name] = valueOf(f, givenOf(f, value), opts, settingNaming(f));
+  }
+  for (const raw of opts.clear ?? []) {
+    const key = raw.replace(/^--/, "").trim();
+    const f = byName.get(key);
+    if (!f) return unknown(key, " to clear");
+    if (Object.prototype.hasOwnProperty.call(settings, f.name)) {
+      throw failed(`settings.${f.name} was both set and cleared; pick one.`, "conflicting_settings", {
+        field: `settings.${f.name}`,
+        setting: f.name,
+      });
+    }
+    settings[f.name] = null;
+  }
+  return settings;
+}
+
+/** @returns A value by name as the flag values {@link valueOf} checks; refused when its type can't be the setting's. */
+function givenOf(f: SettingField, value: SettingValue): Array<string | boolean> {
+  const label = `settings.${f.name}`;
+  const wrongType = (wants: string): never => {
+    throw failed(`${label} takes ${wants}.`, `invalid_${reasonPart(f.flag)}`, { field: label, setting: f.name, rule: "type" });
+  };
+  if (f.type === "string_list") {
+    if (typeof value === "string") return [value];
+    if (Array.isArray(value)) return value;
+    return wrongType("a list of text");
+  }
+  if (Array.isArray(value)) return wrongType(f.type === "integer" ? "a whole number" : f.type === "boolean" ? "true or false" : "text");
+  if (f.type === "boolean") {
+    if (typeof value === "boolean") return [value ? true : "false"];
+    return typeof value === "string" ? [value] : wrongType("true or false");
+  }
+  if (f.type === "integer") {
+    if (typeof value === "number") return Number.isInteger(value) ? [String(value)] : wrongType(`a whole number${range(f)}`);
+    return typeof value === "string" ? [value] : wrongType(`a whole number${range(f)}`);
+  }
+  return typeof value === "string" ? [value] : wrongType("text");
+}
+
+/** How a refusal names the setting it is about: the flag on the command line, or the field in a tool's arguments. */
+interface Naming {
+  /** `--slot-minutes`, or `settings.slot_minutes`. */
+  label: string;
+  /** Says where to look in the refusal's details: `{ flag }`, or `{ field, setting }`. */
+  details: Record<string, unknown>;
+  /** How to put a value back to the default: "use --clear to remove one". */
+  clearHint: string;
+}
+
+/** @returns The naming for a flag. */
+function flagNaming(f: SettingField): Naming {
   const flag = `--${f.flag}`;
+  return { label: flag, details: { flag }, clearHint: "use --clear to remove one" };
+}
+
+/** @returns The naming for a setting given by name, as a tool takes it. */
+function settingNaming(f: SettingField): Naming {
+  const field = `settings.${f.name}`;
+  return { label: field, details: { field, setting: f.name }, clearHint: `put "${f.name}" in clear to remove one` };
+}
+
+/** @returns The value one setting's flag gives, checked. */
+function valueOf(f: SettingField, given: Array<string | boolean>, opts: FromFlagsOptions, naming: Naming): unknown {
+  const flag = naming.label;
   const part = reasonPart(f.flag);
   const invalid = (why: string, rule: string, extra: Record<string, unknown> = {}): never => {
-    throw failed(`${flag} ${why}.`, `invalid_${part}`, { flag, rule, ...extra });
+    throw failed(`${flag} ${why}.`, `invalid_${part}`, { ...naming.details, rule, ...extra });
   };
   const tooLong = (value: string, limit: number): void => {
     if (limit > 0 && value.length > limit) {
       throw failed(`${flag} is at most ${limit} characters (got ${value.length}).`, `${part}_too_long`, {
-        flag,
+        ...naming.details,
         limit,
         length: value.length,
       });
@@ -188,7 +281,7 @@ function valueOf(f: SettingField, given: Array<string | boolean>, opts: FromFlag
     if (items.some((v) => LINE_BREAK.test(v))) invalid("takes one line each time it is given", "type");
     if (f.maxItems > 0 && items.length > f.maxItems) {
       throw failed(`At most ${f.maxItems} ${flag} values (got ${items.length}).`, `too_many_${f.name}`, {
-        flag,
+        ...naming.details,
         limit: f.maxItems,
         count: items.length,
       });
@@ -249,13 +342,13 @@ function valueOf(f: SettingField, given: Array<string | boolean>, opts: FromFlag
         throw failed(
           `${plainText(value)} is no longer offered. Choose one of ${offered.join(", ")}, or leave ${flag} out for the default.`,
           "model_retired",
-          { flag, model: value, allowed: offered },
+          { ...naming.details, model: value, allowed: offered },
         );
       }
       return value;
     }
     case "url": {
-      if (!value) return invalid("needs a URL; use --clear to remove one", "url");
+      if (!value) return invalid(`needs a URL; ${naming.clearHint}`, "url");
       tooLong(value, f.maxLength);
       const scheme = opts.allowHttp ? /^https?:\/\/[^/]/i : /^https:\/\/[^/]/i;
       let host = "";
@@ -315,12 +408,21 @@ export function checkRequired(
   stored: Record<string, unknown>,
   change: Record<string, unknown>,
   agentName: string,
+  /** `settings`: the refusal names the setting as a tool takes it, rather than the flag. */
+  naming: "flags" | "settings" = "flags",
 ): void {
   for (const f of setup.settings) {
     if (!f.required) continue;
     const value = Object.prototype.hasOwnProperty.call(change, f.name) ? change[f.name] : stored[f.name];
     if (isEmpty(value)) {
       const what = f.label ? ` (${plainText(f.label)})` : "";
+      if (naming === "settings") {
+        throw failed(
+          `${plainText(agentName)} needs the setting "${f.name}"${what}. Pass it in settings.`,
+          `missing_${reasonPart(f.flag)}`,
+          { field: `settings.${f.name}`, setting: f.name },
+        );
+      }
       throw failed(
         `${plainText(agentName)} needs --${f.flag}${what}. Pass --${f.flag} <${f.type === "integer" ? "n" : "value"}>.`,
         `missing_${reasonPart(f.flag)}`,

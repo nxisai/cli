@@ -10,9 +10,9 @@
 
 import { createOrganization, listOrganizations, updateOrganization, type Organization } from "../api/accounts.js";
 import type { Ctx } from "../context.js";
-import { requireOrg, requireSession } from "../context.js";
+import { currentOrg, requireOrg, requireSession } from "../context.js";
 import { failed, needsUser } from "../errors.js";
-import { bold } from "../output.js";
+import { bold, plainText } from "../output.js";
 import { saveActiveOrg } from "../state.js";
 
 /** Arguments for `nxis orgs create`. */
@@ -27,7 +27,7 @@ export interface OrgsCreateArgs {
  * carrying none of the details a real one would have. Reusing it keeps the account tidy and
  * means a user who started in the browser and finished in the terminal ends up with one org.
  */
-function isStub(org: Organization): boolean {
+export function isStub(org: Organization): boolean {
   return !org.onboarded && !org.website && !org.industry;
 }
 
@@ -43,7 +43,24 @@ function isStub(org: Organization): boolean {
  * @throws CliError `org_name_required` (exit 2) when no name is given.
  */
 export async function cmdOrgsCreate(ctx: Ctx, args: OrgsCreateArgs): Promise<void> {
-  const { config, io } = ctx;
+  const out = await orgsCreateOp(ctx, args);
+  const label = out.name ?? out.org_id;
+  ctx.io.emit(out, () =>
+    out.reused ? `Reusing your existing organization ${bold(label)} (${out.org_id}).` : `Created ${bold(label)} (${out.org_id}).`,
+  );
+}
+
+/**
+ * `nxis orgs create`, and `nxis_create_org` in `nxis mcp serve`: the organization created (or the
+ * placeholder renamed), saved as the current one.
+ *
+ * @throws CliError `org_name_required` (exit 2) when no name is given.
+ */
+export async function orgsCreateOp(
+  ctx: Ctx,
+  args: OrgsCreateArgs,
+): Promise<{ ok: true; org_id: string; name: string | null; reused: boolean }> {
+  const { config } = ctx;
 
   const name = args.name?.trim();
   if (!name) {
@@ -73,40 +90,36 @@ export async function cmdOrgsCreate(ctx: Ctx, args: OrgsCreateArgs): Promise<voi
   }
 
   saveActiveOrg(org.id);
-
-  io.emit(
-    { ok: true, org_id: org.id, name: org.name, reused },
-    () =>
-      reused
-        ? `Reusing your existing organization ${bold(org.name ?? org.id)} (${org.id}).`
-        : `Created ${bold(org.name ?? org.id)} (${org.id}).`,
-  );
+  return { ok: true, org_id: org.id, name: org.name ?? null, reused };
 }
 
 /** Runs `nxis orgs list`. */
 export async function cmdOrgsList(ctx: Ctx): Promise<void> {
-  const { config, io } = ctx;
-  const { token, accountId } = await requireSession(ctx);
-  const orgs = await listOrganizations(config, token, accountId);
-  const active = ctx.orgOverride ?? null;
-
-  io.emit(
-    {
-      ok: true,
-      orgs: orgs.map((o) => ({
-        id: o.id,
-        name: o.name,
-        website: o.website,
-        onboarded: o.onboarded,
-      })),
-    },
-    () =>
-      orgs.length === 0
-        ? "No organizations yet. Run `nxis orgs create --name \"…\"`."
-        : orgs
-            .map((o) => `${o.id === active ? "*" : " "} ${(o.name ?? "(unnamed)").padEnd(24)} ${o.id}`)
-            .join("\n"),
+  const out = await orgsListOp(ctx);
+  ctx.io.emit(out, () =>
+    out.orgs.length === 0
+      ? "No organizations yet. Run `nxis orgs create --name \"…\"`."
+      : out.orgs.map((o) => `${o.current ? "*" : " "} ${(o.name ?? "(unnamed)").padEnd(24)} ${o.id}`).join("\n"),
   );
+}
+
+/**
+ * `nxis orgs list`, and `nxis_list_orgs`: the account's organizations, and which one commands act on
+ * (`--org`, else the saved one).
+ */
+export async function orgsListOp(ctx: Ctx): Promise<{
+  ok: true;
+  current_org_id: string | null;
+  orgs: Array<{ id: string; name: string | null; website: string | null; onboarded: boolean; current: boolean }>;
+}> {
+  const { token, accountId } = await requireSession(ctx);
+  const orgs = await listOrganizations(ctx.config, token, accountId);
+  const active = currentOrg(ctx);
+  return {
+    ok: true,
+    current_org_id: active,
+    orgs: orgs.map((o) => ({ id: o.id, name: o.name ?? null, website: o.website ?? null, onboarded: o.onboarded, current: o.id === active })),
+  };
 }
 
 /**
@@ -115,21 +128,34 @@ export async function cmdOrgsList(ctx: Ctx): Promise<void> {
  * @throws CliError `org_not_found` when the account is not a member.
  */
 export async function cmdOrgsUse(ctx: Ctx, orgId: string): Promise<void> {
-  const { config, io } = ctx;
+  const out = await orgsUseOp(ctx, orgId);
+  ctx.io.emit(out, () => `Now using ${bold(out.name ?? out.org_id)}.`);
+}
+
+/**
+ * `nxis orgs use`, and `nxis_use_org`: saves the organization, by id or by its exact name (any
+ * case, when only one has it), as the current one.
+ *
+ * @throws CliError `org_not_found` (exit 1) when the account is not a member of one;
+ * `org_ambiguous` (exit 1) for a name more than one organization has.
+ */
+export async function orgsUseOp(ctx: Ctx, ref: string): Promise<{ ok: true; org_id: string; name: string | null }> {
   const { token, accountId } = await requireSession(ctx);
-
-  const orgs = await listOrganizations(config, token, accountId);
-  const match = orgs.find((o) => o.id === orgId);
-  if (!match) {
-    throw failed(
-      `You are not a member of an organization with id ${orgId}.`,
-      "org_not_found",
-      { org_id: orgId },
-    );
+  const wanted = ref.trim();
+  const orgs = await listOrganizations(ctx.config, token, accountId);
+  const byName = orgs.filter((o) => (o.name ?? "").trim().toLowerCase() === wanted.toLowerCase());
+  const match = orgs.find((o) => o.id === wanted) ?? (byName.length === 1 ? byName[0] : undefined);
+  if (!match && byName.length > 1) {
+    throw failed(`More than one of your organizations is called "${plainText(wanted)}"; use its id.`, "org_ambiguous", {
+      org: wanted,
+      org_ids: byName.map((o) => o.id),
+    });
   }
-
+  if (!match) {
+    throw failed(`You are not a member of an organization with id ${plainText(wanted)}.`, "org_not_found", { org_id: wanted });
+  }
   saveActiveOrg(match.id);
-  io.emit({ ok: true, org_id: match.id, name: match.name }, () => `Now using ${bold(match.name ?? match.id)}.`);
+  return { ok: true, org_id: match.id, name: match.name ?? null };
 }
 
 /** Arguments for `nxis orgs update`. */

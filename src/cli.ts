@@ -38,193 +38,10 @@ import { createIo } from "./output.js";
 import { loadSettings, updateSettings } from "./state.js";
 import { packageVersion } from "./self.js";
 import { setTrace } from "./trace.js";
+import { offerSignIn } from "./guided/sign-in.js";
+import { checkFlags } from "./command-flags.js";
+import { HELP } from "./help.js";
 
-/** The `--help` text. */
-const HELP = `nxis — set up NxisAI from the terminal
-
-Usage
-  nxis <command> [options]
-
-Getting set up
-  signup                     Sign in, create an organization, and list plans
-  login [--web]              Sign in with Google (device code; --web uses a browser redirect)
-  status                     Where you are in setup — safe to run any time
-  plans                      Plans available to buy
-  subscribe <tier>           Activate a free plan, or pay for a paid one
-  credits                    Credit balance
-  credits packs              Buyable credit packs
-  credits buy <sku>          Buy a top-up (needs an active plan first)
-  mcp install                Wire the onboarding tools into your agent, as a local
-                             server (\`nxis mcp serve\`) with no key in its config
-  mcp install --remote       Instead, create an MCP key and wire in the remote endpoint
-  mcp serve                  Run the onboarding tools as a local MCP server on stdio; asks
-                             you, through your agent, before a call that spends credits or
-                             goes public
-
-Site data
-  crawl submit [<sitemap-url>] [--wait]
-                             Check the sitemap names the site's host, then crawl it
-  crawl status [<sitemap-url>] [--wait]
-  autofill plan [--existing import_and_complete|import|generate]
-                [--media-type HTML|IMAGE|VIDEO|AUDIO] [--pattern <path>]
-                             Count what structured data would cover; changes nothing
-  autofill submit [same options] [--yes] [--wait]
-                             Generate it — spends credits, asks first, submits once
-  autofill status [--batch <id>] [--wait] [--recent]
-                             Follow a batch; --recent lists the site's latest batches
-  publish [--dry-run] [--type <schema-type>] [--yes]
-                             Make generated data live — asks first (--dry-run counts it)
-
-Your site's MCP server, actions and discovery
-  mcp public on|off          Make the site's MCP server public, or not; prints its endpoint
-  mcp settings [--set key=value …]
-                             Show the MCP settings, or change public, listed_in_app, on_page_agent
-  actions bind <action|booking|default> --connection <name|id>
-               | --webhook <url> | --gateway | --self-page
-                             Route an action's submissions (reserve, quote, …, the Booking agent,
-                             or every action). --webhook reuses the connection with that address,
-                             or creates one named from its host
-               [--supports-check[=false]] [--availability-url <url>]
-                             Booking only: check availability before booking, and where free
-                             times are read (an empty value clears it)
-  actions on|off             Turn the site's action tools on or off, keeping every route
-  connections list           The site's connections: name, address, secret preview, who uses each
-  connections create --name <name> --url <url> [--default]
-                             A named address for agents and actions to send to; its signing
-                             secret is shown once. --default makes it the site's default
-  connections rotate <name|id> [--yes]
-                             A new signing secret, shown once; the old one stops working. Asks first
-  connections delete <name|id> [--yes]
-                             Delete one nothing uses any more. Asks first
-  discovery files [--write] [--out <dir>]
-                             Print llms.txt, agents.md and the AI catalogs; --write merges them
-                             into public/ or static/ (or --out), showing a diff, never overwriting
-  types                      The types the site's MCP server serves, with counts
-  query <type> [--text <q>] [--filter path=op:value …] [--limit n]
-                             Typed records; --text is a semantic search, billed to the organization
-
-Organizations
-  orgs create --name <name> [--website <url>]
-  orgs list
-  orgs use <org-id>
-  orgs update [--name <name>] [--website <url>] [--industry <text>]
-
-Sites (the site steps of the Site Onboarding skill)
-  sites create <url> [--name <name>]    Step 1: create the site and make it current
-  sites list                            The organization's sites; * marks the current one
-  sites use <id|domain>                 Pick the site the other commands act on
-  sites verify --token                  Step 2: the META tag to deploy to production
-  sites verify --check                  Step 3: check the tag is live (exit 2 until it is)
-  sites name <name>                     Step 9: the name the NxisAI app lists it under
-  sites list-in-app [--preview] [--off] Step 9: list it in the NxisAI app (--preview changes nothing)
-  sites tag [status|issue]              After onboarding: the site tag, for a verified site
-
-Site keys (for software on the site's own server that needs one narrow write)
-  keys create --scope content_gaps:report
-                             A key for the current site that can only report its content gaps;
-                             shown once
-  keys list [--all]          The current site's keys you created; --all includes revoked ones
-  keys revoke <key-id>       Revoke a key; it stops working on its next use
-
-Hosted agents (by catalog id: page, support, quote, booking ...; changes reach the site within seconds)
-  agents status              What runs on the current site: each agent, the chat's branding, the
-                             kill switch, the policy version, the verified hosts, what holds
-                             back going live, and any notices
-  agents dpa                 The data processing agreement going live needs: its current
-                             version, where to read it, and who accepted it and when
-  agents dpa accept [--yes]  Accept the current version for your organization, covering all of
-                             its sites, after showing it and its link; asks first (exit 2 with no
-                             terminal, until --yes says the user agreed)
-  agents dpa accept --site <id> --entity <name>
-                             Accept it for a site that belongs to a different legal entity than
-                             your organization: that entity accepts, for that site only
-  agents catalog [--job <job>]... [--industry <name>]... [--readiness <r>]...
-                 [--added|--not-added] [--query <words>] [--by-fit]
-                             The agents NxisAI offers: fit, readiness, whether NxisAI hosts it,
-                             whether the site has it, and what it still needs
-  agents catalog <id>        One agent: its settings as flags with their limits, what it needs,
-                             and the enable line that works
-  agents enable <id> [--<setting> <value>]... [--connection <name|id>]
-                             Turn an agent on (page, support, quote, booking ...), with any of its
-                             settings: page|support take --label, --description, --example
-                             (repeats, replaces the list) and --model, as \`agents catalog <id>\`
-                             lists. --connection routes its requests (Quote, Booking); exit 2
-                             connection_required lists the site's connections
-  agents configure <id> [--<setting> <value>]... [--clear <setting>]...
-                             Change an agent's settings without turning it on or off
-  agents disable <id>        Turn an agent off, keeping its settings
-  agents pause [<id>] [--tools] [--reason <text>]
-                             Kill switch: refuse every turn, or with --tools only actions
-                             (tools that change something); --reason is what visitors are told. Names one
-                             agent, or with none, every hosted agent on the site
-  agents resume [<id>]       Turn that agent's pause off, or with none, the site-wide one
-  agents brand [--name <text>] [--logo <https url>] [--accent <#rrggbb>]
-               [--privacy-url <https url>] [--clear name|logo|accent|privacy-url]...
-                             The chat's look on the site: the name visitors see (at most 60
-                             characters), the logo, the accent color (#rgb or #rrggbb) and the
-                             privacy page; only the parts given change, --clear resets one
-  agents policy set <file.json | ->
-                             Replace the guardrails policy document (\`-\` reads stdin). The
-                             hosted agents follow NxisAI's instructions, so it can't set
-                             "systemPrompt"
-  agents policy show [--instructions]
-                             The policy document as stored, and the version of NxisAI's
-                             instructions the on-page assistant follows; --instructions
-                             prints them in full
-  agents transcripts list [--limit <n>] [--page-token <t>]
-                             The site's stored conversations, newest first
-  agents transcripts show <id>
-                             One conversation, every message in order
-  agents transcripts export [--out <file>] [--format json|csv] [--force]
-                             Every conversation with its messages, every page; stdout without --out
-  agents transcripts delete <id> | --all [--yes]
-                             Delete one conversation, or every one; asks first, cannot be undone
-  agents transcripts settings [--retention-days <n>] [--dont-store | --store]
-                             How long conversations are kept (1 to 3650 days), or none stored
-  agents transcripts webhook set <url> [--keep-secret]
-                             Send each message to a URL, signed with a new secret shown once;
-                             --keep-secret changes the URL only
-  agents transcripts webhook remove | status
-                             Remove the webhook and its secret, or show how deliveries are going
-
-Other
-  whoami                     Who is signed in
-  logout                     Forget stored credentials
-  update [--check] [--to <version>] [--from <dir>]
-                             Update nxis: in place when the installer put it there (signed
-                             releases only), else the command that updates it
-
-Options
-  --json                     Machine-readable output, one object on stdout
-  --verbose                  Print every request before it is sent, secrets removed
-  --dry-run                  Show what would be sent, without changing anything
-  --api <url>                Point at another NxisAI environment
-  --org <id>                 Act on this organization instead of the saved one
-  --site <id|domain>         Act on this site instead of the saved one
-  --no-open                  Print payment links instead of opening a browser
-  --timeout <minutes>        How long to wait for a payment (default 15), a crawl (30) or a batch (60)
-  --yes                      Skip the confirmation (autofill submit, publish, agents transcripts delete,
-                             agents dpa accept)
-  --agent <name>             mcp install: claude-code, cursor or mcp-json (default: detected)
-  --scope <scope>            keys create: what the key may do (content_gaps:report)
-  --force                    Replace an existing MCP server entry
-  --print                    Print the MCP config instead of installing it
-  --read-only                mcp serve (and install): refuse every call that may change something
-  --allow-unconfirmed        mcp serve (and install): when the agent can't ask you, run risky calls
-                             on its own approval instead of refusing them
-
-Environment
-  NXIS_API                   Base URL for every service, same as --api
-  NXIS_TOKEN                 Use this access token instead of signing in
-  NXIS_SITES_URL             Base URL for the sites service (hosted agent settings)
-  NXIS_DPA_URL               Where the data processing agreement is published (default
-                             https://nxis.ai/dpa; each version at <url>/<version>)
-  NXIS_NO_BROWSER=1          Print URLs instead of opening a browser
-  NXIS_NO_KEYCHAIN=1         Store credentials in a file instead of the OS keychain
-
-Exit codes
-  0  done     2  needs you (sign-in or payment pending)     3  not authorized     1  failed
-`;
 
 /**
  * Runs one CLI invocation.
@@ -236,7 +53,7 @@ Exit codes
  * @param argv - Arguments after the executable and script path.
  * @returns The process exit code.
  */
-export async function main(argv: string[]): Promise<number> {
+export async function main(argv: string[], retried = false): Promise<number> {
   const { positional, flags } = parseArgs(argv);
 
   // Before help: `nxis --version` has no command, and would otherwise get the help text.
@@ -256,8 +73,12 @@ export async function main(argv: string[]): Promise<number> {
   setTrace({ verbose: bool(flags, "verbose"), dryRun: bool(flags, "dry-run") });
 
   const [command, sub, third] = positional;
+  let signInCtx: Ctx | undefined;
 
   try {
+    // Before anything is read, saved or sent: a flag the command doesn't take is a typo, or a
+    // flag from a newer release, and running without it would do something else.
+    checkFlags(positional, flags);
     const saved = loadSettings();
     const api = str(flags, "api");
     // Inside the try: resolving the configuration can reject a bad base URL, and that failure
@@ -287,6 +108,7 @@ export async function main(argv: string[]): Promise<number> {
       ...(str(flags, "org") ? { orgOverride: str(flags, "org") as string } : {}),
       ...(str(flags, "site") ? { siteOverride: str(flags, "site") as string } : {}),
     };
+    signInCtx = ctx;
 
     switch (command) {
       case "signup":
@@ -330,9 +152,9 @@ export async function main(argv: string[]): Promise<number> {
         break;
 
       case "subscribe": {
-        if (!sub) throw new CliError("Which plan? Try `nxis plans` first.", { reason: "missing_tier" });
+        // With no plan named, a terminal offers the choice; anywhere else it stops with `missing_tier`.
         await cmdSubscribe(ctx, {
-          tier: sub,
+          ...(sub ? { tier: sub } : {}),
           noOpen: bool(flags, "no-open"),
           ...(num(flags, "timeout") !== undefined ? { timeoutMinutes: num(flags, "timeout") as number } : {}),
         });
@@ -448,6 +270,12 @@ export async function main(argv: string[]): Promise<number> {
     }
     return ExitCode.OK;
   } catch (err) {
+    // On a terminal, a command that needs a sign-in offers one, then runs again, once.
+    if (!retried && signInCtx) {
+      const signedIn = await offerSignIn(signInCtx, err, [command, sub], bool(flags, "yes")).catch((e: unknown) => e);
+      if (signedIn === true) return main(argv, true);
+      if (signedIn instanceof Error) return report(signedIn, json);
+    }
     return report(err, json);
   }
 }

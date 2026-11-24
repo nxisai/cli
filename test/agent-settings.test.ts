@@ -71,4 +71,10 @@ describe("settingsFromFlags", () => {
   it("clears with null, and ignores the global flags", () => {
     expect(from(["--clear", "suggestion", "--json", "--site", "x"], { clear: ["suggestion"], reserved: reservedWith("clear") })).toEqual({ suggestions: null });
   });
+
+  it("clears by the setting's name as well as its flag", () => {
+    expect(from([], { clear: ["suggestions"] })).toEqual({ suggestions: null });
+    expect(from([], { clear: ["chat_name", "logo-url"] })).toEqual({ chat_name: null, logo_url: null });
+    expect(() => from([], { clear: ["suggestionz"] })).toThrow(CliError);
+  });
 });

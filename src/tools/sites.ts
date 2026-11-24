@@ -8,6 +8,7 @@
  * answers come from `nxis_list_sites`, so both are here.
  */
 
+import { PRODUCTION_ENDPOINTS } from "../config.js";
 import type { Ctx } from "../context.js";
 import { requireSite } from "../context.js";
 import { needsUser } from "../errors.js";
@@ -140,9 +141,11 @@ export async function resolveSiteId(ctx: Ctx, value: string, client?: ToolCaller
  * The URL of the current site's own MCP endpoint, where `nxis_list_types` and `nxis_query` run.
  *
  * @remarks
- * In order: `NXIS_SITE_MCP_URL`, for a local stack, where the site's own host does not resolve to
- * the local server; else the `mcp.endpoint` that `nxis_list_sites` reports for the site
- * (`https://<host>/mcp`). The CLI sends no key to it, so the site's MCP server has to be enabled and
+ * In order: `NXIS_SITE_MCP_URL`; else the `mcp.endpoint` that `nxis_list_sites` reports for the
+ * site (`https://<host>/mcp`). When the CLI points at another stack than production (`--api`,
+ * `NXIS_MCP_URL`), that host names the site's server in production, so the read goes to the
+ * stack's own route for it instead: `<mcp base>/tenant/<host>/mcp` (see {@link stackMcpUrl}).
+ * The CLI sends no key to it, so the site's MCP server has to be enabled and
  * public: a site's own endpoint names a host the CLI did not choose, and the provisioning key is
  * not sent anywhere but the provisioning endpoint.
  *
@@ -174,5 +177,32 @@ export async function siteMcpUrl(ctx: Ctx, opts: { provisioning?: ToolCaller } =
       { site: site.site, endpoint: mcp.endpoint },
     );
   }
-  return mcp.endpoint;
+  return stackMcpUrl(ctx.config.endpoints.mcp, mcp.endpoint);
+}
+
+/**
+ * A site's MCP endpoint, on the stack the CLI points at.
+ *
+ * @remarks
+ * Against production, the endpoint as reported. Against another stack, a site's host
+ * (`<name>.mcp.<domain>`) does not reach that stack, which serves each site's server at
+ * `<mcp base>/tenant/<host>/mcp` instead. An endpoint already on the stack's origin is kept.
+ *
+ * @param mcpBase - The MCP base URL the CLI points at.
+ * @param endpoint - The endpoint `nxis_list_sites` reports for the site.
+ * @returns The URL to read from.
+ */
+export function stackMcpUrl(mcpBase: string, endpoint: string): string {
+  const base = mcpBase.replace(/\/+$/, "");
+  if (base === PRODUCTION_ENDPOINTS.mcp) return endpoint;
+  let site: URL;
+  let stack: URL;
+  try {
+    site = new URL(endpoint);
+    stack = new URL(base);
+  } catch {
+    return endpoint;
+  }
+  if (site.origin === stack.origin) return endpoint;
+  return `${base}/tenant/${site.hostname}/mcp`;
 }
